@@ -1,0 +1,64 @@
+[package]
+name = "jlivef"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+colored = "2.1"
+eframe = { version = "0.27", default-features = true }
+egui_extras = "0.27"
+encoding_rs = "0.8"
+embed-resource = "2.4"
+html-escape = "0.2"
+is_elevated = "0.1"
+quick-xml = { version = "0.31", features = ["serialize"] }
+rand = "0.8"
+regex = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+rayon = "1.10"
+walkdir = "2.5"
+url = "2.5"
+uuid = { version = "1.10", features = ["v4"] }
+webbrowser = "0.8"
+sysinfo = "0.30"
+winit = { version = "0.29", features = ["rwh_06"] }
+wmi = "0.12"
+wry = "0.40"
+windows = { version = "0.57", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_SystemInformation",
+    "Win32_System_Services",
+    "Win32_System_Com",
+    "Win32_System_SystemServices",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console"
+] }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+winreg = "0.55"
+
+[[bin]]
+name = "JliveF"
+path = "src/main.rs"
+
+[build-dependencies]
+embed-resource = "2.4"
+
+[patch.crates-io]
+khronos_api = { path = "vendor/khronos_api" }

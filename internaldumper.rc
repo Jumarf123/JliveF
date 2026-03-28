@@ -1,0 +1,4 @@
+#define RT_MANIFEST 24
+
+1 ICON "logo/logo.ico"
+1 RT_MANIFEST "internaldumper.manifest"
