@@ -259,6 +259,14 @@ pub fn process_dump_file(path: &Path) -> Result<ProcessedDump> {
     })
 }
 
+pub fn write_simple_dump_file(path: &Path, report_path: &Path) -> Result<()> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("reading dump file {}", path.display()))?;
+    let parsed = parse_dump(&raw)?;
+    let text = render_simple_report(&parsed);
+    write_atomic(report_path, text.as_bytes())
+}
+
 fn parse_dump(input: &str) -> Result<RawDump> {
     let mut dump = RawDump {
         target_java: None,
@@ -432,6 +440,13 @@ fn parse_method_record(value: &str) -> MemberRecord {
         generic_signature: String::new(),
     };
 
+    if !value.contains('|') {
+        let (name, signature) = split_member_signature(value.trim());
+        record.name = name;
+        record.signature = signature;
+        return record;
+    }
+
     let parts: Vec<&str> = value.split('|').map(str::trim).collect();
     if let Some(modifiers) = parts.first() {
         record.modifiers = clean_value(modifiers);
@@ -454,6 +469,17 @@ fn parse_field_record(value: &str) -> MemberRecord {
         signature: String::new(),
         generic_signature: String::new(),
     };
+
+    if !value.contains('|') {
+        let trimmed = value.trim();
+        if let Some((name, signature)) = trimmed.split_once(':') {
+            record.name = clean_value(name);
+            record.signature = clean_value(signature);
+        } else {
+            record.name = clean_value(trimmed);
+        }
+        return record;
+    }
 
     let parts: Vec<&str> = value.split('|').map(str::trim).collect();
     if let Some(modifiers) = parts.first() {
@@ -500,8 +526,10 @@ fn build_report_class_for_dump(raw: RawClass, dump_profile: Option<&str>) -> Res
         && origin.kind == OriginKind::Unknown
         && !has_any_provenance
         && !trusted_runtime;
-    let weak_provenance =
-        !core_profile && origin.kind == OriginKind::Unknown && has_any_provenance && !trusted_runtime;
+    let weak_provenance = !core_profile
+        && origin.kind == OriginKind::Unknown
+        && has_any_provenance
+        && !trusted_runtime;
     let source_reference = derive_source_reference(&raw, &origin);
     let has_source_reference = !source_reference.trim().is_empty();
     let source_reference_missing_signal = !core_profile && !has_source_reference;
@@ -1381,6 +1409,66 @@ fn render_text_report(parsed: &RawDump, classes: &[ReportClass]) -> String {
     out
 }
 
+fn render_simple_report(parsed: &RawDump) -> String {
+    let mut classes = parsed.classes.clone();
+    classes.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut out = String::new();
+    out.push_str("JLIVEF SIMPLE DUMPER\n");
+    if let Some(pid) = parsed.target_pid {
+        out.push_str(&format!("Target PID: {pid}\n"));
+    }
+    if let Some(profile) = &parsed.dump_profile {
+        out.push_str(&format!("Source Profile: {profile}\n"));
+    }
+    if let Some(java) = &parsed.target_java {
+        out.push_str(&format!("Java: {java}\n"));
+    }
+    out.push_str(&format!("Classes: {}\n\n", classes.len()));
+
+    for class in &classes {
+        out.push_str(&format!("Class: {}\n", class.name));
+        out.push_str("  Methods:\n");
+        if class.methods.is_empty() {
+            out.push_str("    <none>\n");
+        } else {
+            for method in &class.methods {
+                out.push_str(&format!(
+                    "    {}{}{}\n",
+                    method.name,
+                    method.signature,
+                    if method.generic_signature.is_empty() || method.generic_signature == "-" {
+                        String::new()
+                    } else {
+                        format!(" | Generic={}", method.generic_signature)
+                    }
+                ));
+            }
+        }
+
+        out.push_str("  Fields:\n");
+        if class.fields.is_empty() {
+            out.push_str("    <none>\n");
+        } else {
+            for field in &class.fields {
+                out.push_str(&format!(
+                    "    {} : {}{}\n",
+                    field.name,
+                    field.signature,
+                    if field.generic_signature.is_empty() || field.generic_signature == "-" {
+                        String::new()
+                    } else {
+                        format!(" | Generic={}", field.generic_signature)
+                    }
+                ));
+            }
+        }
+        out.push('\n');
+    }
+
+    out
+}
+
 fn display_or_unknown(value: &str) -> String {
     if value.trim().is_empty() {
         "Unknown".to_string()
@@ -1964,7 +2052,10 @@ FieldCount: 0
         assert_eq!(inspection.session_id.as_deref(), Some("abc-123"));
         assert_eq!(inspection.dump_profile.as_deref(), Some("extended"));
         assert_eq!(inspection.transport_mode.as_deref(), Some("runtime_attach"));
-        assert_eq!(inspection.dump_completion.as_deref(), Some("partial_success"));
+        assert_eq!(
+            inspection.dump_completion.as_deref(),
+            Some("partial_success")
+        );
         assert_eq!(inspection.target_pid, Some(4242));
         assert_eq!(inspection.target_java.as_deref(), Some("21"));
         assert_eq!(inspection.target_arch.as_deref(), Some("x64"));
@@ -1972,6 +2063,24 @@ FieldCount: 0
         assert_eq!(inspection.classes_enumerated, Some(5));
         assert_eq!(inspection.classes_dumped, 1);
         assert_eq!(inspection.classes_skipped, Some(4));
+    }
+
+    #[test]
+    fn parse_method_record_supports_simple_format() {
+        let method = parse_method_record("setProfile(Ljava/lang/String;)V");
+        assert_eq!(method.modifiers, "");
+        assert_eq!(method.name, "setProfile");
+        assert_eq!(method.signature, "(Ljava/lang/String;)V");
+        assert_eq!(method.generic_signature, "");
+    }
+
+    #[test]
+    fn parse_field_record_supports_simple_format() {
+        let field = parse_field_record("profileName : Ljava/lang/String;");
+        assert_eq!(field.modifiers, "");
+        assert_eq!(field.name, "profileName");
+        assert_eq!(field.signature, "Ljava/lang/String;");
+        assert_eq!(field.generic_signature, "");
     }
 
     #[test]

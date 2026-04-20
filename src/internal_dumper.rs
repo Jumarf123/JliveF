@@ -1,6 +1,9 @@
+use crate::bypass_scan::utils::run_powershell;
 use crate::dump_report;
+use crate::external_dumper;
 use anyhow::{Context, Result, anyhow};
 use chrono::Local;
+use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString, c_void};
 use std::fs;
@@ -206,6 +209,30 @@ struct JavaProcessEntry {
     working_set_gb: f64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ProcessMetadata {
+    command_line: Option<String>,
+    main_hint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessMetadataJson {
+    #[serde(rename = "commandLine")]
+    command_line: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DumperKind {
+    Internal,
+    External,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InternalDumperMode {
+    Complex,
+    Simple,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RemoteDumpSessionConfig {
@@ -280,6 +307,15 @@ struct ProfileRunResult {
     result_label: String,
 }
 
+#[derive(Debug, Clone)]
+struct SimpleProfileRunResult {
+    strategy: AttachStrategy,
+    transport_mode: TransportMode,
+    status: DumpSessionStatus,
+    inspection: dump_report::DumpInspection,
+    result_label: String,
+}
+
 #[derive(Debug, Serialize)]
 struct SessionManifest {
     session_id: String,
@@ -325,6 +361,7 @@ struct SessionProfileSummary {
 }
 
 pub fn run_dumper() -> Result<()> {
+    colored::control::set_override(true);
     let processes = list_java_processes()?;
     if processes.is_empty() {
         return Err(anyhow!("No running javaw.exe processes were found"));
@@ -345,64 +382,42 @@ pub fn run_dumper() -> Result<()> {
         .read_line(&mut selection)
         .context("reading process selection")?;
     let target = resolve_process_selection(selection.trim(), &processes)?;
-
     let runtime = detect_runtime(target.pid).context("detecting target runtime")?;
-    let session = DumpSession::create(target.pid)?;
-    let agent_path = session.stage_agent(&locate_agent(&runtime)?)?;
-    let attach_order = attach_strategy_order(&runtime);
+    let metadata = query_process_metadata(target.pid);
 
-    println!("Target PID: {}", target.pid);
-    println!(
-        "Detected runtime: Java {} [{}] via {}",
-        runtime.java_major,
-        runtime.arch.label(),
-        runtime.jvm_path.display()
-    );
-    println!(
-        "Runtime kind: {} | vendor hint: {}",
-        runtime.runtime_kind.label(),
-        runtime.vendor_hint
-    );
-    println!("Agent flavor: {}", runtime.agent_flavor.label());
-    println!(
-        "Attach order: {}",
-        attach_order
-            .iter()
-            .map(|item| item.label())
-            .collect::<Vec<_>>()
-            .join(" -> ")
-    );
-    println!("Results: {}", session.session_dir.display());
-    println!("Transport: {}", session.transport_dir.display());
-    println!("Using agent: {}", agent_path.display());
+    print_selected_process(&target, &runtime, &metadata);
+
+    match prompt_dumper_kind(runtime.java_major)? {
+        DumperKind::External => {
+            external_dumper::run_for_pid(target.pid)?;
+        }
+        DumperKind::Internal => match prompt_internal_mode(&metadata)? {
+            InternalDumperMode::Complex => run_complex_dumper(&target, &runtime)?,
+            InternalDumperMode::Simple => run_simple_dumper(&target, &runtime)?,
+        },
+    }
+
+    Ok(())
+}
+
+fn run_complex_dumper(target: &JavaProcessEntry, runtime: &DetectedRuntime) -> Result<()> {
+    let session = DumpSession::create(target.pid)?;
+    let agent_path = session.stage_agent(&locate_agent(runtime)?)?;
 
     let core = match run_profile(
         target.pid,
-        &runtime,
+        runtime,
         &session.session_id,
         &session.core,
         &agent_path,
         None,
     ) {
-        Ok(result) => {
-            println!("Core dump: {}", result.processed.report_path.display());
-            println!("Core HTML: {}", result.processed.html_path.display());
-            println!(
-                "Core classes: dumped={} enumerated={} skipped={}",
-                result.inspection.classes_dumped,
-                result
-                    .inspection
-                    .classes_enumerated
-                    .unwrap_or(result.inspection.classes_dumped),
-                result.inspection.classes_skipped.unwrap_or(0)
-            );
-            result
-        }
+        Ok(result) => result,
         Err(err) => {
             let manifest = build_manifest(
                 &session,
-                &target,
-                &runtime,
+                target,
+                runtime,
                 SessionProfileSummary {
                     profile: DumpProfile::Core.label().to_string(),
                     result: "error".to_string(),
@@ -441,62 +456,222 @@ pub fn run_dumper() -> Result<()> {
 
     let extended = match run_profile(
         target.pid,
-        &runtime,
+        runtime,
         &session.session_id,
         &session.extended,
         &agent_path,
         Some(core.strategy),
     ) {
-        Ok(result) => {
-            println!("Extended dump: {}", result.processed.report_path.display());
-            println!("Extended HTML: {}", result.processed.html_path.display());
-            println!(
-                "Extended classes: dumped={} enumerated={} skipped={} result={}",
-                result.inspection.classes_dumped,
-                result
-                    .inspection
-                    .classes_enumerated
-                    .unwrap_or(result.inspection.classes_dumped),
-                result.inspection.classes_skipped.unwrap_or(0),
-                result.result_label
-            );
-            summary_from_result(DumpProfile::Extended, &session.extended, &result)
-        }
-        Err(err) => {
-            println!("Extended phase did not complete cleanly: {err}");
-            SessionProfileSummary {
-                profile: DumpProfile::Extended.label().to_string(),
-                result: "error".to_string(),
-                attach_strategy: Some(core.strategy.label().to_string()),
-                transport_mode: Some(core.transport_mode.label().to_string()),
-                status_path: session.extended.status_json_path.display().to_string(),
-                log_path: session.extended.agent_log_path.display().to_string(),
-                rawdump_path: session
-                    .extended
-                    .rawdump_final_path
-                    .exists()
-                    .then(|| session.extended.rawdump_final_path.display().to_string()),
-                report_path: None,
-                html_path: None,
-                classes_enumerated: None,
-                classes_dumped: None,
-                classes_skipped: None,
-                message: Some(err.to_string()),
-            }
-        }
+        Ok(result) => summary_from_result(DumpProfile::Extended, &session.extended, &result),
+        Err(err) => SessionProfileSummary {
+            profile: DumpProfile::Extended.label().to_string(),
+            result: "error".to_string(),
+            attach_strategy: Some(core.strategy.label().to_string()),
+            transport_mode: Some(core.transport_mode.label().to_string()),
+            status_path: session.extended.status_json_path.display().to_string(),
+            log_path: session.extended.agent_log_path.display().to_string(),
+            rawdump_path: session
+                .extended
+                .rawdump_final_path
+                .exists()
+                .then(|| session.extended.rawdump_final_path.display().to_string()),
+            report_path: None,
+            html_path: None,
+            classes_enumerated: None,
+            classes_dumped: None,
+            classes_skipped: None,
+            message: Some(err.to_string()),
+        },
     };
 
     let manifest = build_manifest(
         &session,
-        &target,
-        &runtime,
+        target,
+        runtime,
         summary_from_result(DumpProfile::Core, &session.core, &core),
         extended,
     );
     write_manifest(&session.manifest_path, &manifest)?;
-    println!("Session manifest: {}", session.manifest_path.display());
-    println!("Minecraft process was left running.");
+    println!("Results: {}", session.session_dir.display());
     Ok(())
+}
+
+fn run_simple_dumper(target: &JavaProcessEntry, runtime: &DetectedRuntime) -> Result<()> {
+    let session = DumpSession::create(target.pid)?;
+    let agent_path = stage_agent_for_simple(&session, &locate_agent(runtime)?)?;
+
+    let result = run_profile_simple(
+        target.pid,
+        runtime,
+        &session.session_id,
+        &session.core,
+        &agent_path,
+        None,
+    )?;
+    let simple_report_path = session.session_dir.join("classes-simple.txt");
+    dump_report::write_simple_dump_file(&session.core.rawdump_final_path, &simple_report_path)
+        .with_context(|| {
+            format!(
+                "building simple report from {}",
+                session.core.rawdump_final_path.display()
+            )
+        })?;
+
+    let _ = cleanup_simple_session(&session);
+    let _ = (
+        result.strategy,
+        result.transport_mode,
+        result.status,
+        result.inspection,
+        result.result_label,
+    );
+    println!("Results: {}", simple_report_path.display());
+    Ok(())
+}
+
+fn query_process_metadata(pid: u32) -> ProcessMetadata {
+    let script = format!(
+        r#"
+$proc = Get-CimInstance Win32_Process -Filter "ProcessId = {pid}" -ErrorAction SilentlyContinue
+if ($null -ne $proc) {{
+  [pscustomobject]@{{
+    executablePath = [string]$proc.ExecutablePath
+    commandLine = [string]$proc.CommandLine
+  }} | ConvertTo-Json -Compress -Depth 3
+}}
+"#
+    );
+
+    let Some(raw) = run_powershell(&script) else {
+        return ProcessMetadata::default();
+    };
+    let Ok(parsed) = serde_json::from_str::<ProcessMetadataJson>(raw.trim()) else {
+        return ProcessMetadata::default();
+    };
+
+    let command_line = parsed.command_line.filter(|value| !value.trim().is_empty());
+    let main_hint = command_line.as_deref().and_then(extract_java_main_hint);
+
+    ProcessMetadata {
+        command_line,
+        main_hint,
+    }
+}
+
+fn print_selected_process(
+    target: &JavaProcessEntry,
+    runtime: &DetectedRuntime,
+    metadata: &ProcessMetadata,
+) {
+    let _ = (target, runtime, metadata);
+}
+
+fn prompt_dumper_kind(java_major: u32) -> Result<DumperKind> {
+    let external_recommended = java_major >= 9;
+    println!();
+    println!("Choose dumper for Java {}:", java_major);
+    print_choice_line(1, "internal dumper", !external_recommended);
+    print_choice_line(2, "external dumper", external_recommended);
+    print!("Select dumper: ");
+    io::stdout().flush().ok();
+
+    match read_menu_choice()?.as_str() {
+        "1" => Ok(DumperKind::Internal),
+        "2" => Ok(DumperKind::External),
+        other => Err(anyhow!("Unknown dumper selection: {other}")),
+    }
+}
+
+fn prompt_internal_mode(metadata: &ProcessMetadata) -> Result<InternalDumperMode> {
+    let simple_recommended = process_contains_lunarclient(metadata);
+    println!();
+    println!("Choose internal dumper mode:");
+    print_choice_line(1, "complex", !simple_recommended);
+    print_choice_line(2, "simple", simple_recommended);
+    print!("Select mode: ");
+    io::stdout().flush().ok();
+
+    match read_menu_choice()?.as_str() {
+        "1" => Ok(InternalDumperMode::Complex),
+        "2" => Ok(InternalDumperMode::Simple),
+        other => Err(anyhow!("Unknown internal dumper mode: {other}")),
+    }
+}
+
+fn print_choice_line(index: usize, label: &str, recommended: bool) {
+    let text = if recommended {
+        format!("{index}) {label} (recommended)").green()
+    } else {
+        format!("{index}) {label}").red()
+    };
+    println!("{text}");
+}
+
+fn read_menu_choice() -> Result<String> {
+    let mut choice = String::new();
+    io::stdin()
+        .read_line(&mut choice)
+        .context("reading menu choice")?;
+    Ok(choice.trim().to_string())
+}
+
+fn process_contains_lunarclient(metadata: &ProcessMetadata) -> bool {
+    metadata
+        .main_hint
+        .as_deref()
+        .or(metadata.command_line.as_deref())
+        .map(|value| value.to_ascii_lowercase().contains("lunarclient"))
+        .unwrap_or(false)
+}
+
+fn extract_java_main_hint(command_line: &str) -> Option<String> {
+    let tokens = tokenize_command_line(command_line);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut index = 1usize;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if token == "-cp" || token == "-classpath" {
+            index += 2;
+            continue;
+        }
+        if token == "-jar" {
+            return tokens.get(index + 1).cloned();
+        }
+        if token.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return Some(token.clone());
+    }
+
+    None
+}
+
+fn tokenize_command_line(command_line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in command_line.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
 }
 
 impl DumpSession {
@@ -510,14 +685,14 @@ impl DumpSession {
             .ok_or_else(|| anyhow!("Cannot resolve executable directory"))?;
         let preferred_session_dir = exe_dir
             .join("results")
-            .join("internal_dumper")
+            .join("dumper")
             .join(format!("{timestamp}-{pid}-{session_id}"));
         let session_dir = match fs::create_dir_all(&preferred_session_dir) {
             Ok(()) => preferred_session_dir,
             Err(_) => {
                 let fallback = std::env::temp_dir()
                     .join("jlivef")
-                    .join("internal_dumper")
+                    .join("dumper")
                     .join(format!("{timestamp}-{pid}-{session_id}"));
                 fs::create_dir_all(&fallback)
                     .with_context(|| format!("creating session dir {}", fallback.display()))?;
@@ -528,7 +703,7 @@ impl DumpSession {
         let transport_dir = session_dir.join("_transport");
         let config_dir = std::env::temp_dir()
             .join("jlivef")
-            .join("internal_dumper_attach")
+            .join("dumper_attach")
             .join(&session_id);
         let core_dir = session_dir.join(DumpProfile::Core.label());
         let extended_dir = session_dir.join(DumpProfile::Extended.label());
@@ -599,7 +774,10 @@ impl ProfileArtifacts {
             format!("agent_flavor={}", runtime.agent_flavor.label()),
             format!("dump_profile={}", self.profile.label()),
             format!("transport_mode={}", transport_mode.label()),
-            format!("batch_size={}", self.batch_size_from_transport(transport_mode)),
+            format!(
+                "batch_size={}",
+                self.batch_size_from_transport(transport_mode)
+            ),
             "close_after_success=0".to_string(),
             "resume_allowed=0".to_string(),
             format!("session_id={session_id}"),
@@ -822,11 +1000,6 @@ fn run_profile(
         let transport_mode = strategy.transport_mode();
         artifacts.write_config(pid, runtime, session_id, transport_mode)?;
         clear_profile_artifacts(artifacts)?;
-        println!(
-            "Starting {} phase with {}",
-            artifacts.profile.label(),
-            strategy.label()
-        );
         match start_dump_session(pid, runtime, session_id, artifacts, agent_path, strategy) {
             Ok(()) => {
                 let wait_result = wait_for_session(artifacts, artifacts.timeout(strategy));
@@ -847,10 +1020,10 @@ fn run_profile(
                         }
                     }
                 };
-                let inspection =
-                    dump_report::inspect_dump_file(&artifacts.rawdump_final_path).with_context(
-                        || format!("validating {}", artifacts.rawdump_final_path.display()),
-                    )?;
+                let inspection = dump_report::inspect_dump_file(&artifacts.rawdump_final_path)
+                    .with_context(|| {
+                        format!("validating {}", artifacts.rawdump_final_path.display())
+                    })?;
                 let processed = process_dump_file_with_retry(
                     &artifacts.rawdump_final_path,
                     Duration::from_secs(15),
@@ -883,6 +1056,110 @@ fn run_profile(
         artifacts.profile.label(),
         failures.join(" | ")
     ))
+}
+
+fn run_profile_simple(
+    pid: u32,
+    runtime: &DetectedRuntime,
+    session_id: &str,
+    artifacts: &ProfileArtifacts,
+    agent_path: &Path,
+    forced_strategy: Option<AttachStrategy>,
+) -> Result<SimpleProfileRunResult> {
+    let strategies = forced_strategy
+        .map(|strategy| vec![strategy])
+        .unwrap_or_else(|| attach_strategy_order(runtime));
+    let mut failures = Vec::new();
+
+    for strategy in strategies {
+        let transport_mode = strategy.transport_mode();
+        artifacts.write_config(pid, runtime, session_id, transport_mode)?;
+        clear_profile_artifacts(artifacts)?;
+        match start_dump_session(pid, runtime, session_id, artifacts, agent_path, strategy) {
+            Ok(()) => {
+                let wait_result = wait_for_session(artifacts, artifacts.timeout(strategy));
+                let status = match wait_result {
+                    Ok(status) => status,
+                    Err(err) => {
+                        if artifacts.rawdump_final_path.exists() {
+                            read_status(&artifacts.status_json_path)?.unwrap_or_else(|| {
+                                DumpSessionStatus {
+                                    phase: Some("partial_success".to_string()),
+                                    message: Some(err.to_string()),
+                                    ..DumpSessionStatus::default()
+                                }
+                            })
+                        } else {
+                            failures.push(format!("{}: {err}", strategy.label()));
+                            continue;
+                        }
+                    }
+                };
+                let inspection = dump_report::inspect_dump_file(&artifacts.rawdump_final_path)
+                    .with_context(|| {
+                        format!("validating {}", artifacts.rawdump_final_path.display())
+                    })?;
+                let result_label = match status.phase.as_deref() {
+                    Some("partial_success") => "partial_success".to_string(),
+                    Some("success") => "success".to_string(),
+                    Some(other) => other.to_string(),
+                    None => "success".to_string(),
+                };
+                return Ok(SimpleProfileRunResult {
+                    strategy,
+                    transport_mode,
+                    status,
+                    inspection,
+                    result_label,
+                });
+            }
+            Err(err) => failures.push(format!("{}: {err}", strategy.label())),
+        }
+    }
+
+    Err(anyhow!(
+        "{} phase failed: {}",
+        artifacts.profile.label(),
+        failures.join(" | ")
+    ))
+}
+
+fn stage_agent_for_simple(session: &DumpSession, source: &Path) -> Result<PathBuf> {
+    let staging_dir = session
+        .core
+        .config_path
+        .parent()
+        .ok_or_else(|| anyhow!("Cannot resolve simple staging directory"))?;
+    fs::create_dir_all(staging_dir)
+        .with_context(|| format!("creating {}", staging_dir.display()))?;
+    let staged_agent_path = staging_dir.join("JVMTI_Agent.dll");
+    fs::copy(source, &staged_agent_path).with_context(|| {
+        format!(
+            "copying agent from {} to {}",
+            source.display(),
+            staged_agent_path.display()
+        )
+    })?;
+    Ok(staged_agent_path)
+}
+
+fn cleanup_simple_session(session: &DumpSession) -> Result<()> {
+    for path in [
+        &session.core.output_dir,
+        &session.extended.output_dir,
+        &session.transport_dir,
+    ] {
+        if path.exists() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+    if session.manifest_path.exists() {
+        let _ = fs::remove_file(&session.manifest_path);
+    }
+    if let Some(config_dir) = session.core.config_path.parent() {
+        let _ = fs::remove_dir_all(config_dir);
+    }
+    Ok(())
 }
 
 fn clear_profile_artifacts(artifacts: &ProfileArtifacts) -> Result<()> {
@@ -961,15 +1238,6 @@ fn write_manifest(path: &Path, manifest: &SessionManifest) -> Result<()> {
 }
 
 fn locate_agent(runtime: &DetectedRuntime) -> Result<PathBuf> {
-    let flavor_dirs: &[&str] = match runtime.agent_flavor {
-        AgentFlavor::LegacyJvmti => &["java8"],
-        AgentFlavor::ModernJvmti => &["modern", "java21", "java17"],
-    };
-    let arch_dirs: &[&str] = match runtime.arch {
-        TargetArch::X64 => &["x64", "amd64"],
-        TargetArch::X86 => &["x86", "win32"],
-    };
-
     let exe = std::env::current_exe().context("getting current exe path")?;
     let exe_dir = exe
         .parent()
@@ -987,24 +1255,22 @@ fn locate_agent(runtime: &DetectedRuntime) -> Result<PathBuf> {
         roots.push(cwd);
     }
 
+    resolve_agent_path(&roots, runtime)
+}
+
+fn resolve_agent_path(roots: &[PathBuf], runtime: &DetectedRuntime) -> Result<PathBuf> {
+    let flavor_dirs: &[&str] = match runtime.agent_flavor {
+        AgentFlavor::LegacyJvmti => &["java8"],
+        AgentFlavor::ModernJvmti => &["modern", "java21", "java17"],
+    };
+    let arch_dirs: &[&str] = match runtime.arch {
+        TargetArch::X64 => &["x64", "amd64"],
+        TargetArch::X86 => &["x86", "win32"],
+    };
+
     let mut tried = Vec::new();
     for root in roots {
         for flavor in flavor_dirs {
-            let layouts = [
-                root.join(AGENT_DIR).join(flavor).join("JVMTI_Agent.dll"),
-                root.join(AGENT_DIR)
-                    .join("1")
-                    .join(flavor)
-                    .join("JVMTI_Agent.dll"),
-                root.join(flavor).join("JVMTI_Agent.dll"),
-            ];
-            for candidate in layouts {
-                tried.push(candidate.display().to_string());
-                if candidate.exists() {
-                    return Ok(candidate);
-                }
-            }
-
             for arch_dir in arch_dirs {
                 let layouts = [
                     root.join(AGENT_DIR)
@@ -1023,6 +1289,23 @@ fn locate_agent(runtime: &DetectedRuntime) -> Result<PathBuf> {
                     }
                 }
             }
+
+            if runtime.arch == TargetArch::X64 {
+                let layouts = [
+                    root.join(AGENT_DIR).join(flavor).join("JVMTI_Agent.dll"),
+                    root.join(AGENT_DIR)
+                        .join("1")
+                        .join(flavor)
+                        .join("JVMTI_Agent.dll"),
+                    root.join(flavor).join("JVMTI_Agent.dll"),
+                ];
+                for candidate in layouts {
+                    tried.push(candidate.display().to_string());
+                    if candidate.exists() {
+                        return Ok(candidate);
+                    }
+                }
+            }
         }
     }
 
@@ -1032,6 +1315,68 @@ fn locate_agent(runtime: &DetectedRuntime) -> Result<PathBuf> {
         runtime.arch.label(),
         tried.join(" | ")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use uuid::Uuid;
+
+    fn sample_runtime(arch: TargetArch, flavor: AgentFlavor) -> DetectedRuntime {
+        DetectedRuntime {
+            java_major: 17,
+            arch,
+            vendor_hint: String::new(),
+            jvm_path: PathBuf::new(),
+            runtime_home: PathBuf::new(),
+            agent_flavor: flavor,
+            attach_capabilities: AttachCapabilities {
+                native_injection: true,
+                runtime_jcmd_available: true,
+                external_jcmd_available: true,
+            },
+            runtime_kind: RuntimeKind::Bundled,
+        }
+    }
+
+    #[test]
+    fn locate_agent_prefers_x86_specific_dll() {
+        let root = std::env::temp_dir().join(format!("jlivef-agent-test-{}", Uuid::new_v4()));
+        let generic = root.join(AGENT_DIR).join("java17").join("JVMTI_Agent.dll");
+        let specific = root
+            .join(AGENT_DIR)
+            .join("x86")
+            .join("java17")
+            .join("JVMTI_Agent.dll");
+
+        fs::create_dir_all(generic.parent().expect("generic parent")).expect("create generic dir");
+        fs::create_dir_all(specific.parent().expect("specific parent"))
+            .expect("create specific dir");
+        fs::write(&generic, b"x64").expect("write generic dll");
+        fs::write(&specific, b"x86").expect("write specific dll");
+
+        let runtime = sample_runtime(TargetArch::X86, AgentFlavor::ModernJvmti);
+        let resolved = resolve_agent_path(&[root.clone()], &runtime).expect("resolve x86 agent");
+        assert_eq!(resolved, specific);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn locate_agent_uses_generic_x64_dll_when_available() {
+        let root = std::env::temp_dir().join(format!("jlivef-agent-test-{}", Uuid::new_v4()));
+        let generic = root.join(AGENT_DIR).join("java17").join("JVMTI_Agent.dll");
+
+        fs::create_dir_all(generic.parent().expect("generic parent")).expect("create generic dir");
+        fs::write(&generic, b"x64").expect("write generic dll");
+
+        let runtime = sample_runtime(TargetArch::X64, AgentFlavor::ModernJvmti);
+        let resolved = resolve_agent_path(&[root.clone()], &runtime).expect("resolve x64 agent");
+        assert_eq!(resolved, generic);
+
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 fn start_dump_session(
@@ -1466,17 +1811,17 @@ fn inject_agent_native_inner(
     let remote_module = find_remote_module_base(pid, agent_path)?
         .ok_or_else(|| anyhow!("Injected module not found in target after LoadLibraryW"))?;
     let local_module = unsafe { LoadLibraryW(PCWSTR(to_wide(agent_path).as_ptr()))? };
-    let local_start = unsafe { GetProcAddress(local_module, PCSTR::from_raw(b"StartDumpSession\0".as_ptr())) }
-        .ok_or_else(|| anyhow!("StartDumpSession export not found"))?;
+    let local_start = unsafe {
+        GetProcAddress(
+            local_module,
+            PCSTR::from_raw(b"StartDumpSession\0".as_ptr()),
+        )
+    }
+    .ok_or_else(|| anyhow!("StartDumpSession export not found"))?;
     let offset = (local_start as usize).saturating_sub(local_module.0 as usize);
     let remote_start = (remote_module + offset) as *mut c_void;
 
-    let remote_config = artifacts.to_remote_config(
-        session_id,
-        runtime,
-        pid,
-        transport_mode,
-    );
+    let remote_config = artifacts.to_remote_config(session_id, runtime, pid, transport_mode);
     let remote_cfg_mem = write_remote_bytes(
         process,
         &remote_config as *const RemoteDumpSessionConfig as *const c_void,

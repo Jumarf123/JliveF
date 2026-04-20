@@ -29,7 +29,7 @@ sysinfo = "0.30"
 winit = { version = "0.29", features = ["rwh_06"] }
 wmi = "0.12"
 wry = "0.40"
-windows = { version = "0.57", features = [
+windows = { version = "0.56", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
@@ -52,6 +52,7 @@ windows = { version = "0.57", features = [
 ] }
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 winreg = "0.55"
+screenshare_toolkit = { package = "rust_project", path = "screenshare_toolkit/rust_project" }
 
 [[bin]]
 name = "JliveF"
@@ -60,5 +61,14 @@ path = "src/main.rs"
 [build-dependencies]
 embed-resource = "2.4"
 
+[profile.product]
+inherits = "dev"
+opt-level = 1
+debug = false
+strip = "debuginfo"
+incremental = false
+codegen-units = 16
+
 [patch.crates-io]
 khronos_api = { path = "vendor/khronos_api" }
+object = { git = "https://github.com/gimli-rs/object", tag = "0.37.3" }

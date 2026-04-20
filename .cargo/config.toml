@@ -1,0 +1,7 @@
+[source.crates-io]
+registry = "sparse+https://index.crates.io/"
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-Lnative=C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/lib/onecore/x64",
+]

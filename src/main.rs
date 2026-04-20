@@ -10,6 +10,7 @@ use windows::core::PCWSTR;
 
 mod bypass_scan;
 mod dump_report;
+mod external_dumper;
 mod found_faker;
 mod internal_dumper;
 mod jvmti_detector;
@@ -17,7 +18,14 @@ mod netscan;
 mod script_finder;
 mod winliveinfo;
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(error) = run_app() {
+        display_error_and_wait("JliveF failed", &error.to_string());
+        std::process::exit(1);
+    }
+}
+
+fn run_app() -> Result<()> {
     require_admin()?;
 
     if std::env::var("JLIVEF_MODE").as_deref() == Ok("winliveinfo") {
@@ -26,34 +34,44 @@ fn main() -> Result<()> {
 
     loop {
         println!("\nJlivef");
-        println!("1) Internal Dumper");
+        println!("1) Dumper");
         println!("2) Network Scanner");
         println!("3) WinLiveInfo (Live system viewer)");
         println!("4) JVMTI detector");
         println!("5) Found Faker");
         println!("6) Bypass Scanner");
         println!("7) Script Launch Finder");
-        println!("8) Exit");
+        println!("8) Screenshare Toolkit");
+        println!("9) Exit");
         print!("Select option: ");
         io::stdout().flush().ok();
 
         let mut choice = String::new();
         io::stdin().read_line(&mut choice)?;
-        match choice.trim() {
-            "1" => internal_dumper::run_dumper()?,
+        let action = match choice.trim() {
+            "1" => internal_dumper::run_dumper(),
             "2" => {
                 netscan::run_scan_flow();
+                Ok(())
             }
-            "3" => run_winliveinfo_ui()?,
-            "4" => jvmti_detector::run_detector_cli()?,
-            "5" => found_faker::run_found_faker()?,
-            "6" => bypass_scan::run_bypass_scan_flow()?,
-            "7" => script_finder::run_script_launch_finder()?,
-            "8" => {
+            "3" => run_winliveinfo_ui(),
+            "4" => jvmti_detector::run_detector_cli(),
+            "5" => found_faker::run_found_faker(),
+            "6" => bypass_scan::run_bypass_scan_flow(),
+            "7" => script_finder::run_script_launch_finder(),
+            "8" => run_screenshare_toolkit(),
+            "9" => {
                 println!("Bye.");
                 break;
             }
-            other => println!("Unknown option: {other}"),
+            other => {
+                println!("Unknown option: {other}");
+                continue;
+            }
+        };
+
+        if let Err(error) = action {
+            display_error_and_wait("Operation failed", &format!("{error:#}"));
         }
     }
 
@@ -67,6 +85,12 @@ fn run_winliveinfo_ui() -> Result<()> {
     cmd.spawn()
         .map_err(|e| anyhow!("Failed to spawn WinLiveInfo process: {e}"))?;
     println!("WinLiveInfo started. Close its window to return to the menu.");
+    Ok(())
+}
+
+fn run_screenshare_toolkit() -> Result<()> {
+    screenshare_toolkit::app::run().map_err(|e| anyhow!("Screenshare Toolkit failed: {e}"))?;
+    println!("Returned from Screenshare Toolkit.");
     Ok(())
 }
 
@@ -107,4 +131,12 @@ fn require_admin() -> Result<()> {
     }
 
     std::process::exit(0);
+}
+
+fn display_error_and_wait(title: &str, body: &str) {
+    eprintln!("\n{title}");
+    eprintln!("{body}");
+    eprintln!("\nPress Enter to continue...");
+    let mut input = String::new();
+    let _ = io::stdin().read_line(&mut input);
 }
