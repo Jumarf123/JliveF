@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/Version-15.04.2026-2ea043?style=flat-square" />
+  <img alt="Version" src="https://img.shields.io/badge/Version-21.04.2026-2ea043?style=flat-square" />
   <img alt="Platform" src="https://img.shields.io/badge/Platform-Windows-2ea043?style=flat-square" />
   <img alt="Type" src="https://img.shields.io/badge/Type-Screenshare%20Toolkit-b7410e?style=flat-square" />
 </p>
