@@ -1,6 +1,6 @@
-# Jlivef — Release Notes / Update 21.04.2026
+# Jlivef — Release Notes / Update 23.04.2026
 
-*fixed bugs, and crashed /21.04*
+*add hameleon + faker detect /23.04*
 <p align="center">
   <a href="#ru"><img alt="Русский" src="https://img.shields.io/badge/Русский-Read-1f6feb?style=for-the-badge" /></a>
   <a href="#en"><img alt="English" src="https://img.shields.io/badge/English-Read-1f6feb?style=for-the-badge" /></a>
@@ -102,6 +102,10 @@
 - анализ сервисов
 - и другие вспомогательные инструменты
 
+#### 9. proxy bypass found
+
+- Анализирует практически все сетевые артефакты для поиска `faker / hameleon` и подобных читов
+
 ### Автор
 
 **Jumarf**
@@ -189,6 +193,8 @@ An additional set of utilities for deeper computer inspection:
 - services analysis
 - and other supporting tools
 
+#### 9. proxy bypass found
+- analysis all internet artifacts for find `faker / hameleon` proxy bypass
 ### Author
 
 **Jumarf**
