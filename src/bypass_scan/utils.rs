@@ -97,6 +97,23 @@ pub fn run_command(exe: &str, args: &[&str]) -> Option<String> {
         return Some(cached);
     }
 
+    let text = execute_command(exe, args)?;
+
+    if let Ok(mut cache) = command_cache().lock() {
+        if cache.len() > 800 {
+            cache.clear();
+        }
+        cache.insert(key, text.clone());
+    }
+
+    Some(text)
+}
+
+pub fn run_command_uncached(exe: &str, args: &[&str]) -> Option<String> {
+    execute_command(exe, args)
+}
+
+fn execute_command(exe: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(exe).args(args).output().ok()?;
     let mut text = String::new();
     text.push_str(&decode_windows_command_output(exe, &output.stdout));
@@ -106,14 +123,6 @@ pub fn run_command(exe: &str, args: &[&str]) -> Option<String> {
         }
         text.push_str(&decode_windows_command_output(exe, &output.stderr));
     }
-
-    if let Ok(mut cache) = command_cache().lock() {
-        if cache.len() > 800 {
-            cache.clear();
-        }
-        cache.insert(key, text.clone());
-    }
-
     Some(text)
 }
 
@@ -135,6 +144,14 @@ fn decode_windows_command_output(exe: &str, bytes: &[u8]) -> String {
         || exe_lower.contains("vssadmin")
         || exe_lower.contains("wmic")
         || exe_lower.contains("bcdedit")
+        || exe_lower.contains("ipconfig")
+        || exe_lower.contains("nbtstat")
+        || exe_lower.contains("pathping")
+        || exe_lower.contains("ping")
+        || exe_lower.contains("netstat")
+        || exe_lower.contains("netsh")
+        || exe_lower.contains("route")
+        || exe_lower.contains("arp")
     {
         // These tools commonly use OEM output in RU locale.
         &["ibm866", "windows-1251", "windows-1252"]
@@ -177,13 +194,14 @@ fn decode_utf16_output(bytes: &[u8]) -> Option<String> {
     }
 
     // Some Windows CLIs emit UTF-16LE without BOM.
-    let nul_ratio = bytes
-        .iter()
-        .step_by(2)
-        .filter(|b| **b == 0)
-        .count()
-        .max(bytes.iter().skip(1).step_by(2).filter(|b| **b == 0).count());
-    if nul_ratio >= bytes.len() / 4 {
+    if bytes.len() < 8 || bytes.len() % 2 != 0 {
+        return None;
+    }
+
+    let even_nuls = bytes.iter().step_by(2).filter(|b| **b == 0).count();
+    let odd_nuls = bytes.iter().skip(1).step_by(2).filter(|b| **b == 0).count();
+    let nul_ratio = even_nuls.max(odd_nuls);
+    if nul_ratio >= bytes.len() / 8 && nul_ratio >= 2 {
         let u16s = bytes
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -1428,15 +1446,27 @@ fn as_bool_from_json(value: &Value) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_looks_like_prefetch, extract_event_data_value, extract_fsutil_value,
-        extract_xml_tag_value, is_maybe_prefetch_name, is_usn_journal_available_output,
-        is_usn_journal_missing_output, parse_event_log_state_json, parse_event_records,
+        decode_looks_like_prefetch, decode_utf16_output, extract_event_data_value,
+        extract_fsutil_value, extract_xml_tag_value, is_maybe_prefetch_name,
+        is_usn_journal_available_output, is_usn_journal_missing_output, parse_event_log_state_json,
+        parse_event_records,
     };
 
     #[test]
     fn confusable_prefetch_name_detected() {
         assert!(is_maybe_prefetch_name("Prеfetch"));
         assert_eq!(decode_looks_like_prefetch("Prеfetch"), "prefetch");
+    }
+
+    #[test]
+    fn utf16_heuristic_ignores_short_crlf_buffer() {
+        assert!(decode_utf16_output(b"\r\n").is_none());
+    }
+
+    #[test]
+    fn utf16_heuristic_accepts_utf16le_without_bom() {
+        let bytes = b"T\0e\0s\0t\0\r\0\n\0";
+        assert_eq!(decode_utf16_output(bytes).as_deref(), Some("Test\r\n"));
     }
 
     #[test]

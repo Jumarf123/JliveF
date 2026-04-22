@@ -15,6 +15,7 @@ mod found_faker;
 mod internal_dumper;
 mod jvmti_detector;
 mod netscan;
+mod proxy_bypass_found;
 mod script_finder;
 mod winliveinfo;
 
@@ -42,7 +43,8 @@ fn run_app() -> Result<()> {
         println!("6) Bypass Scanner");
         println!("7) Script Launch Finder");
         println!("8) Screenshare Toolkit");
-        println!("9) Exit");
+        println!("9) proxy bypass found (beta-test)");
+        println!("10) Exit");
         print!("Select option: ");
         io::stdout().flush().ok();
 
@@ -60,7 +62,8 @@ fn run_app() -> Result<()> {
             "6" => bypass_scan::run_bypass_scan_flow(),
             "7" => script_finder::run_script_launch_finder(),
             "8" => run_screenshare_toolkit(),
-            "9" => {
+            "9" => proxy_bypass_found::run_proxy_bypass_found(),
+            "10" => {
                 println!("Bye.");
                 break;
             }
