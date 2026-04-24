@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use chrono::Local;
+use rayon::prelude::*;
 use regex::Regex;
-use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsString, c_void};
@@ -12,6 +12,7 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use sysinfo::System;
+use uuid::Uuid;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, INVALID_HANDLE_VALUE};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -30,12 +31,58 @@ use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
 };
 
+mod collection;
+mod config;
+mod helpers;
+mod models;
+mod packet_capture;
+mod packet_detections;
+mod parsers;
+mod pktmon;
+mod process_memory;
+
 use crate::bypass_scan::utils::{run_command, run_command_uncached, run_powershell, truncate_text};
+#[cfg(test)]
+use collection::sanitize_nbtstat_output;
+use collection::{
+    collect_command, collect_commands_parallel, collect_fresh_command, pause_for_enter,
+    perform_udp_proxy_probes, ping_private_gateways, ping_private_minecraft_peers,
+    pktmon_filters_empty, pktmon_is_running, probe_private_gateways_nbtstat,
+    probe_private_gateways_tcp, probe_private_minecraft_peers_nbtstat,
+    probe_private_minecraft_peers_tcp, sanitize_command_output,
+};
+use config::{
+    LocalConfigArtifact, ProxyConfigSignal, collect_proxy_config_artifacts,
+    parse_proxy_config_signal,
+};
+use helpers::{is_virtualish_adapter, is_vpn_proxy_process_text};
+use models::{
+    AdapterBlock, ArpEntry, CommandArtifact, Confidence, Finding, HandleGuard, ModuleInfo,
+    NbtstatInfo, NetstatTcp, ParallelCommandSpec, PathHop, PortProxyEntry, ProcessMeta, ScanReport,
+};
+use packet_capture::{
+    PacketCaptureAnalysis, PacketTupleStat, analyze_pktmon_capture, find_packet_tuple_stat,
+    packet_activity_for_tuple,
+};
+use packet_detections::{
+    detect_local_proxy_chain, detect_minecraft_handshake_target_mismatch,
+    detect_packet_relay_correlation, detect_private_peer_packet_proxy,
+};
+use parsers::{
+    merge_neighbor_macs, parse_arp_entries, parse_gateway_nbtstat, parse_gateway_open_tcp_ports,
+    parse_gateway_ping_ttls, parse_ipconfig_adapters, parse_netsh_neighbor_macs, parse_netstat_tcp,
+    parse_pathping_hops, parse_peer_nbtstat, parse_peer_open_tcp_ports, parse_portproxy_entries,
+};
+use pktmon::{add_pktmon_live_flow_filters, add_pktmon_probe_filters, detect_pktmon};
+#[cfg(test)]
+use process_memory::{contains_ascii_case_insensitive, normalize_faker_memory_hits};
+use process_memory::{detect_minecraft_process_memory, detect_process_memory};
 
 const MODULE_NAME: &str = "proxy bypass found (beta-test)";
 const DEFAULT_MINECRAFT_PORT_HINTS: &[u16] = &[25565, 25566, 25575];
 const STATIC_PROXY_PROBE_PORTS: &[u16] = &[15000];
 const WINDOWS_HOST_PROBE_PORTS: &[u16] = &[135, 139, 445, 3389];
+const MIN_FAKER_MEMORY_STRING_HITS: usize = 3;
 const MAX_TRACKED_MINECRAFT_PORTS: usize = 12;
 const PROCESS_QUERY_FLAGS: PROCESS_ACCESS_RIGHTS =
     PROCESS_ACCESS_RIGHTS(PROCESS_QUERY_INFORMATION.0 | PROCESS_VM_READ.0);
@@ -48,8 +95,7 @@ $processes = @(Get-CimInstance Win32_Process |
 
 $minecraftPids = @($processes |
   Where-Object {
-    $_.Name -match '^(?i:javaw?\.exe)$' -or
-    $_.CommandLine -match '(?i)minecraft|\.minecraft|net\.minecraft|lwjgl|fabric|forge|lunarclient|badlion|feather'
+    $_.CommandLine -match '(?i)minecraft|\.minecraft|net\.minecraft|minecraft\.launcher|--gameDir|--assetsDir|lwjgl|fabric|forge|legacylauncher|tlauncher|knotclient|lunarclient|badlion|feather'
   } |
   Select-Object -ExpandProperty ProcessId)
 
@@ -129,123 +175,6 @@ $connectionProfiles = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue |
 } | ConvertTo-Json -Depth 5 -Compress
 "#;
 
-#[derive(Clone, Debug, Serialize)]
-struct ScanReport {
-    module: String,
-    started_at: String,
-    finished_at: String,
-    duration_ms: u128,
-    overall: String,
-    findings: Vec<Finding>,
-    adapters: Vec<AdapterBlock>,
-    arp_entries: Vec<ArpEntry>,
-    pathping_hops: Vec<PathHop>,
-    raw_commands: Vec<CommandArtifact>,
-    source_notes: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct Finding {
-    confidence: Confidence,
-    category: String,
-    title: String,
-    details: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum Confidence {
-    High,
-    Medium,
-    Low,
-}
-
-impl Confidence {
-    fn label(&self) -> &'static str {
-        match self {
-            Confidence::High => "HIGH",
-            Confidence::Medium => "MEDIUM",
-            Confidence::Low => "LOW",
-        }
-    }
-
-    fn score(&self) -> u8 {
-        match self {
-            Confidence::High => 3,
-            Confidence::Medium => 2,
-            Confidence::Low => 1,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize)]
-struct AdapterBlock {
-    name: String,
-    description: String,
-    physical_address: String,
-    dhcp_enabled: Option<bool>,
-    ipv4_addresses: Vec<String>,
-    subnet_masks: Vec<String>,
-    default_gateways: Vec<String>,
-    dhcp_servers: Vec<String>,
-    dns_servers: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct ArpEntry {
-    interface: String,
-    ip: String,
-    mac: String,
-    kind: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct PathHop {
-    hop: u32,
-    ip: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct CommandArtifact {
-    name: String,
-    command: String,
-    output: String,
-}
-
-#[derive(Clone, Debug)]
-struct NetstatTcp {
-    local_addr: String,
-    local_port: u16,
-    remote_addr: String,
-    remote_port: u16,
-    state: String,
-    pid: u32,
-}
-
-#[derive(Clone, Debug)]
-struct ProcessMeta {
-    name: String,
-    pid: u32,
-    path: String,
-    command_line: String,
-}
-
-#[derive(Clone, Debug, Default)]
-struct NbtstatInfo {
-    names: Vec<String>,
-    workstation_service: bool,
-    file_server_service: bool,
-    mac: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-struct PortProxyEntry {
-    listen_addr: String,
-    listen_port: u16,
-    connect_addr: String,
-    connect_port: u16,
-}
-
 pub fn run_proxy_bypass_found() -> Result<()> {
     println!("\n{MODULE_NAME}");
     println!(
@@ -271,24 +200,61 @@ fn run_scan() -> Result<ScanReport> {
     let mut findings = Vec::new();
     let mut raw_commands = Vec::new();
 
-    let ipconfig_all = collect_command(&mut raw_commands, "ipconfig_all", "ipconfig", &["/all"]);
+    let pathping_handle = std::thread::spawn(|| {
+        let args = ["/n", "/h", "6", "/q", "1", "/w", "250", "1.1.1.1"];
+        let command = format!("pathping {}", args.join(" "));
+        let output = sanitize_command_output(
+            "pathping_1_1_1_1",
+            "pathping",
+            run_command_uncached("pathping", &args)
+                .unwrap_or_else(|| format!("Failed to run {command}")),
+        );
+        CommandArtifact {
+            name: "pathping_1_1_1_1".to_string(),
+            command,
+            output,
+        }
+    });
+
+    let baseline_outputs = collect_commands_parallel(
+        &mut raw_commands,
+        &[
+            ParallelCommandSpec {
+                name: "ipconfig_all",
+                exe: "ipconfig",
+                args: &["/all"],
+            },
+            ParallelCommandSpec {
+                name: "netstat_tcp",
+                exe: "netstat",
+                args: &["-ano", "-p", "tcp"],
+            },
+            ParallelCommandSpec {
+                name: "netstat_all",
+                exe: "netstat",
+                args: &["-ano"],
+            },
+        ],
+    );
+    let ipconfig_all = baseline_outputs
+        .get("ipconfig_all")
+        .cloned()
+        .unwrap_or_default();
     let adapters = parse_ipconfig_adapters(&ipconfig_all);
     ping_private_gateways(&mut raw_commands, &adapters);
     probe_private_gateways_nbtstat(&mut raw_commands, &adapters);
     let arp_all = collect_command(&mut raw_commands, "arp_all_verbose", "arp", &["-a", "-v"]);
-    let pathping = collect_command(
-        &mut raw_commands,
-        "pathping_1_1_1_1",
-        "pathping",
-        &["/n", "/h", "6", "/q", "1", "/w", "250", "1.1.1.1"],
-    );
-    let netstat = collect_command(
-        &mut raw_commands,
-        "netstat_tcp",
-        "netstat",
-        &["-ano", "-p", "tcp"],
-    );
-    let _netstat_all = collect_command(&mut raw_commands, "netstat_all", "netstat", &["-ano"]);
+    let pathping_artifact = pathping_handle.join().unwrap_or_else(|_| CommandArtifact {
+        name: "pathping_1_1_1_1".to_string(),
+        command: "pathping /n /h 6 /q 1 /w 250 1.1.1.1".to_string(),
+        output: "Failed to join pathping worker".to_string(),
+    });
+    let pathping = pathping_artifact.output.clone();
+    raw_commands.push(pathping_artifact);
+    let netstat = baseline_outputs
+        .get("netstat_tcp")
+        .cloned()
+        .unwrap_or_default();
     let snapshot_raw = run_powershell(POWERSHELL_SNAPSHOT_SCRIPT).unwrap_or_default();
     raw_commands.push(CommandArtifact {
         name: "powershell_snapshot".to_string(),
@@ -299,6 +265,36 @@ fn run_scan() -> Result<ScanReport> {
     let netstat_entries = parse_netstat_tcp(&netstat);
     let snapshot_json = serde_json::from_str::<Value>(snapshot_raw.trim()).unwrap_or(Value::Null);
     let process_map = process_map_from_snapshot(&snapshot_json);
+    let proxy_config_artifacts = collect_proxy_config_artifacts(&mut raw_commands, &process_map);
+    let proxy_config_signals: Vec<ProxyConfigSignal> = proxy_config_artifacts
+        .iter()
+        .filter_map(parse_proxy_config_signal)
+        .collect();
+    if !proxy_config_signals.is_empty() {
+        let mut lines = proxy_config_signals
+            .iter()
+            .map(|signal| {
+                format!(
+                    "{} | tun_if={:?} tun_addr={:?} auto_route={} strict_route={} final_proxy={} loopback_outbounds={:?} route_processes={:?}",
+                    signal.path,
+                    signal.tun_interfaces,
+                    signal.tun_addresses,
+                    signal.auto_route,
+                    signal.strict_route,
+                    signal.final_proxy,
+                    signal.loopback_proxy_outbounds,
+                    signal.route_process_names
+                )
+            })
+            .collect::<Vec<_>>();
+        lines.sort();
+        lines.dedup();
+        raw_commands.push(CommandArtifact {
+            name: "proxy_config_signal_summary".to_string(),
+            command: "parse proxy JSON/YAML configs".to_string(),
+            output: lines.join("\n"),
+        });
+    }
     let minecraft_ports = discover_minecraft_ports(&netstat_entries, &snapshot_json, &process_map);
     let probe_ports = build_proxy_probe_ports(&minecraft_ports);
     raw_commands.push(CommandArtifact {
@@ -313,6 +309,13 @@ fn run_scan() -> Result<ScanReport> {
         active_minecraft_connections(&netstat_entries, &process_map, &minecraft_ports);
 
     probe_private_gateways_tcp(&mut raw_commands, &adapters, &probe_ports);
+    let pktmon_capture_root = std::env::temp_dir().join(format!(
+        "jlivef_proxy_bypass_{}",
+        Uuid::new_v4().as_simple()
+    ));
+    let _ = fs::create_dir_all(&pktmon_capture_root);
+    let pktmon_capture_etl = pktmon_capture_root.join("capture.etl");
+    let pktmon_capture_pcap = pktmon_capture_root.join("capture.pcapng");
     let pktmon_status_before = collect_fresh_command(
         &mut raw_commands,
         "pktmon_status_before",
@@ -330,6 +333,12 @@ fn run_scan() -> Result<ScanReport> {
         !pktmon_initially_running && pktmon_filters_empty(&pktmon_filters_before);
     if pktmon_temp_filters_added {
         add_pktmon_probe_filters(&mut raw_commands, &adapters, &probe_ports);
+        add_pktmon_live_flow_filters(
+            &mut raw_commands,
+            &process_map,
+            &netstat_entries,
+            &minecraft_ports,
+        );
     }
 
     if !pktmon_initially_running {
@@ -337,7 +346,16 @@ fn run_scan() -> Result<ScanReport> {
             &mut raw_commands,
             "pktmon_start_probe",
             "pktmon",
-            &["start", "--capture", "--counters-only", "--comp", "nics"],
+            &[
+                "start",
+                "--capture",
+                "--comp",
+                "nics",
+                "--pkt-size",
+                "0",
+                "--file-name",
+                &pktmon_capture_etl.display().to_string(),
+            ],
         );
     }
     let pktmon_status_after_start = collect_fresh_command(
@@ -350,68 +368,104 @@ fn run_scan() -> Result<ScanReport> {
         !pktmon_initially_running && pktmon_is_running(&pktmon_status_after_start);
     if pktmon_started_by_us {
         perform_udp_proxy_probes(&mut raw_commands, &adapters, &probe_ports);
+        std::thread::sleep(Duration::from_millis(1500));
     }
 
-    let route_print = collect_command(
+    let route_netsh_outputs = collect_commands_parallel(
         &mut raw_commands,
-        "route_print_ipv4",
-        "route",
-        &["print", "-4"],
+        &[
+            ParallelCommandSpec {
+                name: "route_print_ipv4",
+                exe: "route",
+                args: &["print", "-4"],
+            },
+            ParallelCommandSpec {
+                name: "route_print_ipv6",
+                exe: "route",
+                args: &["print", "-6"],
+            },
+            ParallelCommandSpec {
+                name: "netsh_ipv4_config",
+                exe: "netsh",
+                args: &["interface", "ipv4", "show", "config"],
+            },
+            ParallelCommandSpec {
+                name: "netsh_ipv4_neighbors",
+                exe: "netsh",
+                args: &["interface", "ipv4", "show", "neighbors"],
+            },
+            ParallelCommandSpec {
+                name: "netsh_ipv6_neighbors",
+                exe: "netsh",
+                args: &["interface", "ipv6", "show", "neighbors"],
+            },
+            ParallelCommandSpec {
+                name: "netsh_portproxy_show_all",
+                exe: "netsh",
+                args: &["interface", "portproxy", "show", "all"],
+            },
+            ParallelCommandSpec {
+                name: "netsh_bridge_show_adapter",
+                exe: "netsh",
+                args: &["bridge", "show", "adapter"],
+            },
+            ParallelCommandSpec {
+                name: "netsh_bridge_list",
+                exe: "netsh",
+                args: &["bridge", "list"],
+            },
+            ParallelCommandSpec {
+                name: "netsh_wlan_show_interfaces",
+                exe: "netsh",
+                args: &["wlan", "show", "interfaces"],
+            },
+            ParallelCommandSpec {
+                name: "netsh_wlan_show_hostednetwork",
+                exe: "netsh",
+                args: &["wlan", "show", "hostednetwork"],
+            },
+        ],
     );
-    let route_print_ipv6 = collect_command(
-        &mut raw_commands,
-        "route_print_ipv6",
-        "route",
-        &["print", "-6"],
-    );
-    let netsh_ipv4_config = collect_command(
-        &mut raw_commands,
-        "netsh_ipv4_config",
-        "netsh",
-        &["interface", "ipv4", "show", "config"],
-    );
-    let netsh_ipv4_neighbors = collect_command(
-        &mut raw_commands,
-        "netsh_ipv4_neighbors",
-        "netsh",
-        &["interface", "ipv4", "show", "neighbors"],
-    );
-    let netsh_ipv6_neighbors = collect_command(
-        &mut raw_commands,
-        "netsh_ipv6_neighbors",
-        "netsh",
-        &["interface", "ipv6", "show", "neighbors"],
-    );
-    let netsh_portproxy = collect_command(
-        &mut raw_commands,
-        "netsh_portproxy_show_all",
-        "netsh",
-        &["interface", "portproxy", "show", "all"],
-    );
-    let netsh_bridge_show_adapter = collect_command(
-        &mut raw_commands,
-        "netsh_bridge_show_adapter",
-        "netsh",
-        &["bridge", "show", "adapter"],
-    );
-    let netsh_bridge_list = collect_command(
-        &mut raw_commands,
-        "netsh_bridge_list",
-        "netsh",
-        &["bridge", "list"],
-    );
-    let netsh_wlan_show_interfaces = collect_command(
-        &mut raw_commands,
-        "netsh_wlan_show_interfaces",
-        "netsh",
-        &["wlan", "show", "interfaces"],
-    );
-    let netsh_wlan_show_hostednetwork = collect_command(
-        &mut raw_commands,
-        "netsh_wlan_show_hostednetwork",
-        "netsh",
-        &["wlan", "show", "hostednetwork"],
-    );
+    let route_print = route_netsh_outputs
+        .get("route_print_ipv4")
+        .cloned()
+        .unwrap_or_default();
+    let route_print_ipv6 = route_netsh_outputs
+        .get("route_print_ipv6")
+        .cloned()
+        .unwrap_or_default();
+    let netsh_ipv4_config = route_netsh_outputs
+        .get("netsh_ipv4_config")
+        .cloned()
+        .unwrap_or_default();
+    let netsh_ipv4_neighbors = route_netsh_outputs
+        .get("netsh_ipv4_neighbors")
+        .cloned()
+        .unwrap_or_default();
+    let netsh_ipv6_neighbors = route_netsh_outputs
+        .get("netsh_ipv6_neighbors")
+        .cloned()
+        .unwrap_or_default();
+    let netsh_portproxy = route_netsh_outputs
+        .get("netsh_portproxy_show_all")
+        .cloned()
+        .unwrap_or_default();
+    let netsh_bridge_show_adapter = route_netsh_outputs
+        .get("netsh_bridge_show_adapter")
+        .cloned()
+        .unwrap_or_default();
+    let netsh_bridge_list = route_netsh_outputs
+        .get("netsh_bridge_list")
+        .cloned()
+        .unwrap_or_default();
+    let netsh_wlan_show_interfaces = route_netsh_outputs
+        .get("netsh_wlan_show_interfaces")
+        .cloned()
+        .unwrap_or_default();
+    let netsh_wlan_show_hostednetwork = route_netsh_outputs
+        .get("netsh_wlan_show_hostednetwork")
+        .cloned()
+        .unwrap_or_default();
     let pktmon_filters_probe = collect_fresh_command(
         &mut raw_commands,
         "pktmon_filter_list_probe",
@@ -424,7 +478,7 @@ fn run_scan() -> Result<ScanReport> {
         "pktmon",
         &["counters"],
     );
-    let _pktmon_counters_json = collect_fresh_command(
+    let pktmon_counters_json = collect_fresh_command(
         &mut raw_commands,
         "pktmon_counters_probe_json",
         "pktmon",
@@ -446,6 +500,15 @@ fn run_scan() -> Result<ScanReport> {
         "pktmon_status_after_probe",
         "pktmon",
         &["status"],
+    );
+    let packet_capture_analysis = analyze_pktmon_capture(
+        &mut raw_commands,
+        &process_map,
+        &netstat_entries,
+        &minecraft_ports,
+        &pktmon_capture_etl,
+        &pktmon_capture_pcap,
+        pktmon_started_by_us,
     );
 
     if !active_minecraft.is_empty() {
@@ -482,9 +545,9 @@ fn run_scan() -> Result<ScanReport> {
     let peer_tcp_ports = parse_peer_open_tcp_ports(&raw_commands);
     let peer_nbtstat = parse_peer_nbtstat(&raw_commands);
     let mut neighbor_macs = neighbor_macs_from_snapshot(&snapshot_json);
-    merge_neighbor_macs(
-        &mut neighbor_macs,
-        parse_netsh_neighbor_macs(&format!(
+    neighbor_macs = merge_neighbor_macs(
+        &neighbor_macs,
+        &parse_netsh_neighbor_macs(&format!(
             "{netsh_ipv4_neighbors}\n{netsh_ipv4_neighbors_refresh}\n{netsh_ipv6_neighbors}"
         )),
     );
@@ -495,6 +558,7 @@ fn run_scan() -> Result<ScanReport> {
         &pktmon_status_after_start,
         &pktmon_filters_probe,
         &pktmon_counters_probe,
+        &pktmon_counters_json,
         has_minecraft_flow_context,
         &probe_ports,
     );
@@ -507,6 +571,42 @@ fn run_scan() -> Result<ScanReport> {
         &active_minecraft,
         &minecraft_ports,
         &probe_ports,
+    );
+    detect_minecraft_process_network_context(
+        &mut findings,
+        &adapters,
+        &process_map,
+        &netstat_entries,
+        &minecraft_ports,
+        &gateway_ping_ttls,
+    );
+    detect_local_proxy_chain(
+        &mut findings,
+        &process_map,
+        &netstat_entries,
+        &minecraft_ports,
+        packet_capture_analysis.as_ref(),
+    );
+    detect_packet_relay_correlation(
+        &mut findings,
+        &process_map,
+        &netstat_entries,
+        &minecraft_ports,
+        packet_capture_analysis.as_ref(),
+    );
+    detect_minecraft_handshake_target_mismatch(
+        &mut findings,
+        &process_map,
+        &netstat_entries,
+        &minecraft_ports,
+        packet_capture_analysis.as_ref(),
+    );
+    detect_private_peer_packet_proxy(
+        &mut findings,
+        &process_map,
+        &netstat_entries,
+        &minecraft_ports,
+        packet_capture_analysis.as_ref(),
     );
     detect_network_topology(
         &mut findings,
@@ -564,6 +664,12 @@ fn run_scan() -> Result<ScanReport> {
         &probe_ports,
     );
     detect_process_memory(&mut findings);
+    detect_minecraft_process_memory(
+        &mut findings,
+        &process_map,
+        &netstat_entries,
+        &minecraft_ports,
+    );
 
     findings.sort_by(|a, b| {
         b.confidence
@@ -597,423 +703,15 @@ fn run_scan() -> Result<ScanReport> {
         source_notes: vec![
             "Normal home-router shape is not a detection by itself. Network findings require Minecraft/proxy-port activity together with Windows ICS, direct PC-to-PC routing, host-like gateway traits, MAC anomalies, or route/path anomalies.".to_string(),
             "VPN/proxy adapters are reported as context because they intentionally proxy traffic, but generic packet interception drivers are ignored.".to_string(),
-            "When pktmon is not already running, this module starts a short counters-only capture with temporary Minecraft/proxy port filters and removes those filters after collection.".to_string(),
+            "When pktmon is not already running, this module starts a short packet capture with temporary Minecraft/proxy filters for both probe traffic and live flow endpoints, then removes those filters after collection.".to_string(),
             "Minecraft-related ports are auto-discovered from live java/javaw Minecraft traffic and UDP endpoints, so custom ports like 25715 are tracked automatically.".to_string(),
             "future_hook/xameleon evidence is accepted only from explorer.exe loaded modules or explorer.exe memory strings.".to_string(),
             "IPv6, adapter bindings, forwarding state, neighbors and NAT state are collected for correlation, but protocol bindings are not modified by the scanner.".to_string(),
             "Bridge state, NAT static mappings and private-peer host evidence are correlated only when they align with Minecraft/proxy-port activity.".to_string(),
+            "Pktmon captures are converted to pcapng and checked for Minecraft handshake target mismatch, so a private relay endpoint can be compared against the host/port declared inside the packet stream.".to_string(),
+            "Minecraft process-specific detections are based on the java/javaw process itself: its exact flow tuple, bound adapter, loopback peer shape and faker-specific strings in process memory.".to_string(),
         ],
     })
-}
-
-fn collect_command(
-    raw_commands: &mut Vec<CommandArtifact>,
-    name: &str,
-    exe: &str,
-    args: &[&str],
-) -> String {
-    let command = if args.is_empty() {
-        exe.to_string()
-    } else {
-        format!("{} {}", exe, args.join(" "))
-    };
-    let output = sanitize_command_output(
-        name,
-        exe,
-        run_command(exe, args).unwrap_or_else(|| format!("Failed to run {command}")),
-    );
-    raw_commands.push(CommandArtifact {
-        name: name.to_string(),
-        command,
-        output: output.clone(),
-    });
-    output
-}
-
-fn collect_fresh_command(
-    raw_commands: &mut Vec<CommandArtifact>,
-    name: &str,
-    exe: &str,
-    args: &[&str],
-) -> String {
-    let command = if args.is_empty() {
-        exe.to_string()
-    } else {
-        format!("{} {}", exe, args.join(" "))
-    };
-    let output = sanitize_command_output(
-        name,
-        exe,
-        run_command_uncached(exe, args).unwrap_or_else(|| format!("Failed to run {command}")),
-    );
-    raw_commands.push(CommandArtifact {
-        name: name.to_string(),
-        command,
-        output: output.clone(),
-    });
-    output
-}
-
-fn sanitize_command_output(name: &str, exe: &str, output: String) -> String {
-    if exe.eq_ignore_ascii_case("nbtstat") || name.starts_with("nbtstat_") {
-        sanitize_nbtstat_output(&output)
-    } else {
-        output
-    }
-}
-
-fn sanitize_nbtstat_output(text: &str) -> String {
-    let zero_ip_block_re = Regex::new(
-        r"(?ims)(?:^\s*[^\r\n]*:\s*\r?\n)?\s*Node IpAddress:\s*\[0\.0\.0\.0\][^\r\n]*\r?\n(?:\s*\r?\n)?\s*(?:Host not found\.|Узел не найден\.|Не удалось найти узел\.)\s*(?:\r?\n)+",
-    )
-    .unwrap();
-    let normalized = zero_ip_block_re
-        .replace_all(text, "")
-        .to_string()
-        .chars()
-        .filter(|ch| !ch.is_control() || matches!(ch, '\r' | '\n' | '\t'))
-        .collect::<String>()
-        .replace("\r\n", "\n");
-    let mut kept = Vec::new();
-
-    for chunk in normalized.split("\n\n") {
-        let trimmed = chunk.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let lower = trimmed.to_lowercase();
-        let useless_zero_addr = trimmed.contains("0.0.0.0")
-            && (lower.contains("node ipaddress")
-                || lower.contains("node ip address")
-                || lower.contains("ip-адрес узла"));
-        let host_not_found = lower.contains("host not found")
-            || lower.contains("узел не найден")
-            || lower.contains("не удается найти")
-            || lower.contains("не удалось найти");
-        if useless_zero_addr && host_not_found {
-            continue;
-        }
-        kept.push(trimmed.to_string());
-    }
-
-    if kept.is_empty() {
-        text.trim().to_string()
-    } else {
-        kept.join("\r\n\r\n")
-    }
-}
-
-fn ping_private_gateways(raw_commands: &mut Vec<CommandArtifact>, adapters: &[AdapterBlock]) {
-    let mut seen = HashSet::new();
-    for gateway in adapters
-        .iter()
-        .flat_map(|adapter| adapter.default_gateways.iter())
-        .filter(|gateway| is_private_ipv4(gateway))
-    {
-        if !seen.insert(gateway.clone()) {
-            continue;
-        }
-        collect_fresh_command(
-            raw_commands,
-            &format!("ping_gateway_{}", gateway.replace('.', "_")),
-            "ping",
-            &["-n", "1", "-w", "300", gateway],
-        );
-    }
-}
-
-fn probe_private_gateways_tcp(
-    raw_commands: &mut Vec<CommandArtifact>,
-    adapters: &[AdapterBlock],
-    probe_ports: &[u16],
-) {
-    let mut seen = HashSet::new();
-    for gateway in adapters
-        .iter()
-        .flat_map(|adapter| adapter.default_gateways.iter())
-        .filter(|gateway| is_private_ipv4(gateway))
-    {
-        if !seen.insert(gateway.clone()) {
-            continue;
-        }
-        for port in probe_ports
-            .iter()
-            .chain(WINDOWS_HOST_PROBE_PORTS.iter())
-            .copied()
-        {
-            let command = format!("tcp_probe remote={gateway}:{port}");
-            let name = format!("tcp_probe_gateway_{}_{}", gateway.replace('.', "_"), port);
-            let output = probe_tcp_port(gateway, port, 120);
-            raw_commands.push(CommandArtifact {
-                name,
-                command,
-                output,
-            });
-        }
-    }
-}
-
-fn probe_private_gateways_nbtstat(
-    raw_commands: &mut Vec<CommandArtifact>,
-    adapters: &[AdapterBlock],
-) {
-    let mut seen = HashSet::new();
-    for gateway in adapters
-        .iter()
-        .flat_map(|adapter| adapter.default_gateways.iter())
-        .filter(|gateway| is_private_ipv4(gateway))
-    {
-        if !seen.insert(gateway.clone()) {
-            continue;
-        }
-        collect_fresh_command(
-            raw_commands,
-            &format!("nbtstat_gateway_{}", gateway.replace('.', "_")),
-            "nbtstat",
-            &["-A", gateway],
-        );
-    }
-}
-
-fn ping_private_minecraft_peers(
-    raw_commands: &mut Vec<CommandArtifact>,
-    active_minecraft: &[NetstatTcp],
-) {
-    let mut seen = HashSet::new();
-    for peer in active_minecraft
-        .iter()
-        .map(|connection| connection.remote_addr.as_str())
-        .filter(|peer| is_private_ipv4(peer))
-    {
-        if !seen.insert(peer.to_string()) {
-            continue;
-        }
-        collect_fresh_command(
-            raw_commands,
-            &format!("ping_minecraft_peer_{}", peer.replace('.', "_")),
-            "ping",
-            &["-n", "1", "-w", "250", peer],
-        );
-    }
-}
-
-fn probe_private_minecraft_peers_tcp(
-    raw_commands: &mut Vec<CommandArtifact>,
-    active_minecraft: &[NetstatTcp],
-    probe_ports: &[u16],
-) {
-    let mut seen = HashSet::new();
-    for peer in active_minecraft
-        .iter()
-        .map(|connection| connection.remote_addr.as_str())
-        .filter(|peer| is_private_ipv4(peer))
-    {
-        if !seen.insert(peer.to_string()) {
-            continue;
-        }
-        for port in probe_ports
-            .iter()
-            .chain(WINDOWS_HOST_PROBE_PORTS.iter())
-            .copied()
-        {
-            let command = format!("tcp_probe_peer remote={peer}:{port}");
-            let name = format!("tcp_probe_peer_{}_{}", peer.replace('.', "_"), port);
-            let output = probe_tcp_port(peer, port, 120);
-            raw_commands.push(CommandArtifact {
-                name,
-                command,
-                output,
-            });
-        }
-    }
-}
-
-fn probe_private_minecraft_peers_nbtstat(
-    raw_commands: &mut Vec<CommandArtifact>,
-    active_minecraft: &[NetstatTcp],
-) {
-    let mut seen = HashSet::new();
-    for peer in active_minecraft
-        .iter()
-        .map(|connection| connection.remote_addr.as_str())
-        .filter(|peer| is_private_ipv4(peer))
-    {
-        if !seen.insert(peer.to_string()) {
-            continue;
-        }
-        collect_fresh_command(
-            raw_commands,
-            &format!("nbtstat_peer_{}", peer.replace('.', "_")),
-            "nbtstat",
-            &["-A", peer],
-        );
-    }
-}
-
-fn probe_tcp_port(ip: &str, port: u16, timeout_ms: u64) -> String {
-    let Ok(ip) = ip.parse::<Ipv4Addr>() else {
-        return "invalid ip".to_string();
-    };
-    let addr = SocketAddr::new(IpAddr::V4(ip), port);
-    match TcpStream::connect_timeout(&addr, Duration::from_millis(timeout_ms)) {
-        Ok(_) => "open".to_string(),
-        Err(error) => format!("closed: {error}"),
-    }
-}
-
-fn perform_udp_proxy_probes(
-    raw_commands: &mut Vec<CommandArtifact>,
-    adapters: &[AdapterBlock],
-    probe_ports: &[u16],
-) {
-    let mut seen = HashSet::new();
-    for gateway in adapters
-        .iter()
-        .flat_map(|adapter| adapter.default_gateways.iter())
-        .filter(|gateway| is_private_ipv4(gateway))
-    {
-        for port in probe_ports.iter().copied() {
-            let key = format!("{gateway}:{port}");
-            if !seen.insert(key.clone()) {
-                continue;
-            }
-            let command = format!("udp_probe local={port} remote={gateway}:{port}");
-            let name = format!("udp_probe_{}_{}", gateway.replace('.', "_"), port);
-            let output = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)) {
-                Ok(socket) => {
-                    let _ = socket.set_write_timeout(Some(Duration::from_millis(200)));
-                    let payload = format!("JLIVEF-{port}");
-                    match socket.send_to(payload.as_bytes(), format!("{gateway}:{port}")) {
-                        Ok(sent) => format!("sent {} bytes", sent),
-                        Err(error) => format!("send failed: {error}"),
-                    }
-                }
-                Err(error) => format!("bind failed: {error}"),
-            };
-            raw_commands.push(CommandArtifact {
-                name,
-                command,
-                output,
-            });
-        }
-    }
-}
-
-fn pktmon_is_running(status: &str) -> bool {
-    let lower = status.to_lowercase();
-    if lower.contains("not running") || lower.contains("не запущен") {
-        return false;
-    }
-    lower.contains("running")
-        || lower.contains("collected data")
-        || lower.contains("собранные данные")
-}
-
-fn pktmon_filters_empty(filters: &str) -> bool {
-    let lower = filters.to_lowercase();
-    lower.contains("none") || lower.contains("нет")
-}
-
-fn add_pktmon_probe_filters(
-    raw_commands: &mut Vec<CommandArtifact>,
-    adapters: &[AdapterBlock],
-    probe_ports: &[u16],
-) {
-    let gateways = adapters
-        .iter()
-        .flat_map(|adapter| adapter.default_gateways.iter())
-        .filter(|gateway| is_private_ipv4(gateway))
-        .cloned()
-        .collect::<HashSet<_>>();
-
-    if gateways.is_empty() {
-        for port in probe_ports {
-            let port_text = port.to_string();
-            let tcp_name = format!("JliveF_MC_{port}_TCP");
-            collect_fresh_command(
-                raw_commands,
-                &format!("pktmon_filter_add_{port}_tcp"),
-                "pktmon",
-                &["filter", "add", &tcp_name, "-t", "TCP", "-p", &port_text],
-            );
-
-            let udp_name = format!("JliveF_MC_{port}_UDP");
-            collect_fresh_command(
-                raw_commands,
-                &format!("pktmon_filter_add_{port}_udp"),
-                "pktmon",
-                &["filter", "add", &udp_name, "-t", "UDP", "-p", &port_text],
-            );
-        }
-        return;
-    }
-
-    for gateway in gateways {
-        let gateway_id = gateway.replace('.', "_");
-        for port in probe_ports {
-            let port_text = port.to_string();
-            let tcp_name = format!("JliveF_MC_{gateway_id}_{port}_TCP");
-            collect_fresh_command(
-                raw_commands,
-                &format!("pktmon_filter_add_{gateway_id}_{port}_tcp"),
-                "pktmon",
-                &[
-                    "filter", "add", &tcp_name, "-i", &gateway, "-t", "TCP", "-p", &port_text,
-                ],
-            );
-
-            let udp_name = format!("JliveF_MC_{gateway_id}_{port}_UDP");
-            collect_fresh_command(
-                raw_commands,
-                &format!("pktmon_filter_add_{gateway_id}_{port}_udp"),
-                "pktmon",
-                &[
-                    "filter", "add", &udp_name, "-i", &gateway, "-t", "UDP", "-p", &port_text,
-                ],
-            );
-        }
-    }
-}
-
-fn detect_pktmon(
-    findings: &mut Vec<Finding>,
-    status: &str,
-    filters: &str,
-    counters: &str,
-    has_flow_context: bool,
-    probe_ports: &[u16],
-) {
-    let combined = format!("{status}\n{filters}\n{counters}").to_lowercase();
-    let mut details = Vec::new();
-    if probe_ports
-        .iter()
-        .any(|port| combined.contains(&port.to_string()))
-        && pktmon_counters_have_packets(counters)
-        && has_flow_context
-    {
-        details.push("pktmon Minecraft/proxy port filters observed packet counters".to_string());
-    }
-
-    if details.iter().any(|d| d.contains("Minecraft/proxy")) {
-        findings.push(Finding {
-            confidence: Confidence::Medium,
-            category: "pktmon".to_string(),
-            title: "Packet Monitor has proxy-port related state".to_string(),
-            details,
-        });
-    }
-}
-
-fn pktmon_counters_have_packets(counters: &str) -> bool {
-    let lower = counters.to_lowercase();
-    if lower.contains("zero")
-        || lower.contains("нулевые")
-        || lower.contains("no counters")
-        || lower.contains("нет счетчиков")
-    {
-        return false;
-    }
-    lower.contains("packets") || lower.contains("пакеты")
 }
 
 fn detect_powershell_snapshot(
@@ -1505,6 +1203,35 @@ fn active_minecraft_connections(
         .collect()
 }
 
+fn active_minecraft_upstream_connections(
+    entries: &[NetstatTcp],
+    process_map: &HashMap<u32, ProcessMeta>,
+    minecraft_ports: &[u16],
+) -> Vec<NetstatTcp> {
+    entries
+        .iter()
+        .filter(|conn| {
+            let port_match = minecraft_ports.contains(&conn.remote_port)
+                || minecraft_ports.contains(&conn.local_port);
+            let active_state = matches!(
+                conn.state.to_ascii_uppercase().as_str(),
+                "ESTABLISHED" | "SYN_SENT" | "SYN_RECEIVED" | "SYN_RECV"
+            );
+            let client_process = process_map
+                .get(&conn.pid)
+                .map(|p| is_minecraft_client_process(&p.name, &p.command_line))
+                .unwrap_or(false);
+            port_match
+                && active_state
+                && client_process
+                && conn.remote_port != 0
+                && !is_wildcard_ip(&conn.remote_addr)
+                && !is_loopback_ip(&conn.remote_addr)
+        })
+        .cloned()
+        .collect()
+}
+
 fn active_snapshot_minecraft_connections(
     snapshot: &Value,
     process_map: &HashMap<u32, ProcessMeta>,
@@ -1550,6 +1277,81 @@ fn active_snapshot_minecraft_connections(
         });
     }
     entries
+}
+
+fn collect_local_proxy_relay_pids(
+    process_map: &HashMap<u32, ProcessMeta>,
+    netstat_entries: &[NetstatTcp],
+    minecraft_ports: &[u16],
+) -> HashSet<u32> {
+    let upstream_flows =
+        active_minecraft_upstream_connections(netstat_entries, process_map, minecraft_ports);
+    if upstream_flows.is_empty() {
+        return HashSet::new();
+    }
+
+    let remote_endpoints = upstream_flows
+        .iter()
+        .map(|flow| (flow.remote_addr.clone(), flow.remote_port))
+        .collect::<HashSet<_>>();
+    let loopback_listener_ports = netstat_entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.state.to_ascii_uppercase().as_str(),
+                "LISTEN" | "LISTENING"
+            ) && is_loopback_ip(&entry.local_addr)
+        })
+        .fold(HashMap::<u32, HashSet<u16>>::new(), |mut acc, entry| {
+            acc.entry(entry.pid).or_default().insert(entry.local_port);
+            acc
+        });
+
+    let mut relay_pids = HashSet::new();
+    for entry in netstat_entries {
+        if !matches!(
+            entry.state.to_ascii_uppercase().as_str(),
+            "ESTABLISHED" | "SYN_SENT" | "SYN_RECEIVED" | "SYN_RECV"
+        ) {
+            continue;
+        }
+        if entry.remote_port == 0
+            || is_wildcard_ip(&entry.remote_addr)
+            || is_loopback_ip(&entry.remote_addr)
+            || !remote_endpoints.contains(&(entry.remote_addr.clone(), entry.remote_port))
+        {
+            continue;
+        }
+        let Some(process) = process_map.get(&entry.pid) else {
+            continue;
+        };
+        if is_minecraft_client_process(&process.name, &process.command_line) {
+            continue;
+        }
+        let has_listener = loopback_listener_ports
+            .get(&entry.pid)
+            .is_some_and(|ports| !ports.is_empty());
+        let has_loopback_session = netstat_entries.iter().any(|loopback| {
+            loopback.pid == entry.pid
+                && matches!(
+                    loopback.state.to_ascii_uppercase().as_str(),
+                    "ESTABLISHED" | "SYN_SENT" | "SYN_RECEIVED" | "SYN_RECV"
+                )
+                && is_loopback_ip(&loopback.local_addr)
+                && is_loopback_ip(&loopback.remote_addr)
+                && loopback_listener_ports
+                    .get(&entry.pid)
+                    .is_some_and(|ports| {
+                        ports.contains(&loopback.local_port)
+                            || ports.contains(&loopback.remote_port)
+                    })
+        });
+        if has_listener || has_loopback_session {
+            relay_pids.insert(entry.pid);
+        }
+    }
+
+    relay_pids
 }
 
 fn summarize_active_minecraft_flows(
@@ -1611,155 +1413,6 @@ fn count_private_ips_with_mac(mac: &str, arp_entries: &[ArpEntry]) -> usize {
         .map(|entry| entry.ip.as_str())
         .collect::<HashSet<_>>()
         .len()
-}
-
-fn parse_gateway_open_tcp_ports(raw_commands: &[CommandArtifact]) -> HashMap<String, Vec<u16>> {
-    parse_open_tcp_ports(raw_commands, "tcp_probe_gateway_", "tcp_probe remote=")
-}
-
-fn parse_peer_open_tcp_ports(raw_commands: &[CommandArtifact]) -> HashMap<String, Vec<u16>> {
-    parse_open_tcp_ports(raw_commands, "tcp_probe_peer_", "tcp_probe_peer remote=")
-}
-
-fn parse_open_tcp_ports(
-    raw_commands: &[CommandArtifact],
-    name_prefix: &str,
-    command_prefix: &str,
-) -> HashMap<String, Vec<u16>> {
-    let mut ports = HashMap::<String, Vec<u16>>::new();
-    for artifact in raw_commands
-        .iter()
-        .filter(|artifact| artifact.name.starts_with(name_prefix))
-    {
-        if !artifact.output.trim().eq_ignore_ascii_case("open") {
-            continue;
-        }
-        let Some(remote) = artifact.command.strip_prefix(command_prefix) else {
-            continue;
-        };
-        let Some((ip, port)) = remote.rsplit_once(':') else {
-            continue;
-        };
-        if !is_valid_ipv4(ip) {
-            continue;
-        }
-        let Ok(port) = port.parse::<u16>() else {
-            continue;
-        };
-        ports.entry(ip.to_string()).or_default().push(port);
-    }
-
-    for values in ports.values_mut() {
-        values.sort_unstable();
-        values.dedup();
-    }
-
-    ports
-}
-
-fn parse_gateway_nbtstat(raw_commands: &[CommandArtifact]) -> HashMap<String, NbtstatInfo> {
-    parse_nbtstat_artifacts(raw_commands, "nbtstat_gateway_")
-}
-
-fn parse_peer_nbtstat(raw_commands: &[CommandArtifact]) -> HashMap<String, NbtstatInfo> {
-    parse_nbtstat_artifacts(raw_commands, "nbtstat_peer_")
-}
-
-fn parse_nbtstat_artifacts(
-    raw_commands: &[CommandArtifact],
-    name_prefix: &str,
-) -> HashMap<String, NbtstatInfo> {
-    let mut infos = HashMap::new();
-    let name_re =
-        Regex::new(r"(?i)^\s*([^\s]+)\s+<([0-9a-f]{2})>\s+(UNIQUE|GROUP)\s+(\w+)").unwrap();
-    let mac_re = Regex::new(r"(?i)mac address\s*=\s*([0-9a-f-]{17})").unwrap();
-
-    for artifact in raw_commands
-        .iter()
-        .filter(|artifact| artifact.name.starts_with(name_prefix))
-    {
-        let gateway = artifact
-            .command
-            .split_whitespace()
-            .last()
-            .filter(|value| is_valid_ipv4(value))
-            .map(str::to_string)
-            .or_else(|| {
-                artifact
-                    .name
-                    .strip_prefix(name_prefix)
-                    .map(|value| value.replace('_', "."))
-                    .filter(|value| is_valid_ipv4(value))
-            });
-        let Some(gateway) = gateway else {
-            continue;
-        };
-
-        let lower = artifact.output.to_lowercase();
-        if lower.contains("host not found")
-            || lower.contains("не найден")
-            || lower.contains("no response")
-            || lower.contains("нет ответа")
-            || lower.contains("no names in cache")
-        {
-            continue;
-        }
-
-        let mut info = NbtstatInfo::default();
-        for line in artifact.output.lines() {
-            if let Some(cap) = name_re.captures(line) {
-                let name = cap[1].to_string();
-                let code = &cap[2];
-                let group_type = cap[3].to_ascii_uppercase();
-                info.names.push(format!("{}<{}>{}", name, code, group_type));
-                if code.eq_ignore_ascii_case("00") && group_type == "UNIQUE" {
-                    info.workstation_service = true;
-                }
-                if code.eq_ignore_ascii_case("20") && group_type == "UNIQUE" {
-                    info.file_server_service = true;
-                }
-            }
-            if let Some(cap) = mac_re.captures(line) {
-                info.mac = Some(normalize_mac_display(&cap[1]));
-            }
-        }
-
-        info.names.sort();
-        info.names.dedup();
-        if !info.names.is_empty() || info.mac.is_some() {
-            infos.insert(gateway, info);
-        }
-    }
-
-    infos
-}
-
-fn parse_netsh_neighbor_macs(text: &str) -> HashMap<String, HashSet<String>> {
-    let mut neighbors = HashMap::<String, HashSet<String>>::new();
-
-    for line in text.lines() {
-        let columns = line.split_whitespace().collect::<Vec<_>>();
-        if columns.len() < 3 {
-            continue;
-        }
-        let ip = normalize_ip_literal(columns[0]);
-        let mac = normalize_mac_display(columns[1]);
-        if !is_ip_literal(&ip) || mac.trim().is_empty() {
-            continue;
-        }
-        neighbors.entry(ip).or_default().insert(mac);
-    }
-
-    neighbors
-}
-
-fn merge_neighbor_macs(
-    target: &mut HashMap<String, HashSet<String>>,
-    extra: HashMap<String, HashSet<String>>,
-) {
-    for (ip, macs) in extra {
-        target.entry(ip).or_default().extend(macs);
-    }
 }
 
 fn network_signal_score(
@@ -1980,6 +1633,400 @@ fn detect_vpn_proxy_context(
             category: "vpn_proxy_context".to_string(),
             title: "VPN/proxy context detected".to_string(),
             details,
+        });
+    }
+}
+
+#[allow(dead_code)]
+fn detect_same_pc_proxy_chain(
+    findings: &mut Vec<Finding>,
+    adapters: &[AdapterBlock],
+    snapshot: &Value,
+    process_map: &HashMap<u32, ProcessMeta>,
+    netstat_entries: &[NetstatTcp],
+    minecraft_ports: &[u16],
+    proxy_config_artifacts: &[LocalConfigArtifact],
+) {
+    let upstream_flows =
+        active_minecraft_upstream_connections(netstat_entries, process_map, minecraft_ports);
+    if upstream_flows.is_empty() {
+        return;
+    }
+
+    let tunnel_adapters = adapters
+        .iter()
+        .filter(|adapter| {
+            is_virtualish_adapter(adapter)
+                && (!adapter.ipv4_addresses.is_empty() || !adapter.default_gateways.is_empty())
+        })
+        .collect::<Vec<_>>();
+    if tunnel_adapters.is_empty() {
+        return;
+    }
+
+    let mut tunnel_flow_details = Vec::new();
+    let mut tunnel_flow_pids = HashSet::new();
+    let mut tunnel_flow_remote_endpoints = HashSet::new();
+    for flow in &upstream_flows {
+        let Some(adapter) = tunnel_adapters.iter().find(|adapter| {
+            adapter
+                .ipv4_addresses
+                .iter()
+                .any(|ip| ip.eq_ignore_ascii_case(&flow.local_addr))
+        }) else {
+            continue;
+        };
+        let process = process_map.get(&flow.pid);
+        let proc_name = process.map(|p| p.name.as_str()).unwrap_or("unknown");
+        let proc_cmd = process.map(|p| p.command_line.as_str()).unwrap_or("");
+        tunnel_flow_details.push(format!(
+            "{} | {}:{} -> {}:{} {} PID {} {} | {}",
+            adapter.name,
+            flow.local_addr,
+            flow.local_port,
+            flow.remote_addr,
+            flow.remote_port,
+            flow.state,
+            flow.pid,
+            proc_name,
+            truncate_text(proc_cmd, 220)
+        ));
+        tunnel_flow_pids.insert(flow.pid);
+        tunnel_flow_remote_endpoints.insert(format!("{}:{}", flow.remote_addr, flow.remote_port));
+    }
+    if tunnel_flow_details.is_empty() {
+        return;
+    }
+
+    let mut proxy_listener_details = Vec::new();
+    let mut proxy_listener_ports = HashSet::new();
+    for entry in netstat_entries {
+        if !matches!(
+            entry.state.to_ascii_uppercase().as_str(),
+            "LISTEN" | "LISTENING"
+        ) {
+            continue;
+        }
+        if !is_loopback_ip(&entry.local_addr) {
+            continue;
+        }
+        let Some(process) = process_map.get(&entry.pid) else {
+            continue;
+        };
+        let process_text =
+            format!("{} {} {}", process.name, process.path, process.command_line).to_lowercase();
+        if !is_vpn_proxy_process_text(&process_text) {
+            continue;
+        }
+        proxy_listener_details.push(format!(
+            "{}:{} LISTEN PID {} {} | {}",
+            entry.local_addr,
+            entry.local_port,
+            entry.pid,
+            process.name,
+            truncate_text(&process.command_line, 220)
+        ));
+        proxy_listener_ports.insert(entry.local_port);
+    }
+
+    let mut proxy_udp_details = Vec::new();
+    for item in json_items(snapshot.get("Udp")) {
+        let Some(local_port) = json_u16(item, "LocalPort") else {
+            continue;
+        };
+        let local_addr = normalize_ip_literal(&json_string(item, "LocalAddress"));
+        if !is_loopback_ip(&local_addr) {
+            continue;
+        }
+        let pid = json_u32(item, "OwningProcess").unwrap_or(0);
+        let Some(process) = process_map.get(&pid) else {
+            continue;
+        };
+        let process_text =
+            format!("{} {} {}", process.name, process.path, process.command_line).to_lowercase();
+        if !is_vpn_proxy_process_text(&process_text) {
+            continue;
+        }
+        proxy_udp_details.push(format!(
+            "UDP {}:{} PID {} {} | {}",
+            local_addr,
+            local_port,
+            pid,
+            process.name,
+            truncate_text(&process.command_line, 220)
+        ));
+        proxy_listener_ports.insert(local_port);
+    }
+
+    let relay_listener_pids = netstat_entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.state.to_ascii_uppercase().as_str(),
+                "LISTEN" | "LISTENING"
+            )
+        })
+        .filter(|entry| {
+            is_loopback_ip(&entry.local_addr) && minecraft_ports.contains(&entry.local_port)
+        })
+        .filter_map(|entry| {
+            process_map.get(&entry.pid).and_then(|process| {
+                if is_minecraft_client_process(&process.name, &process.command_line) {
+                    Some(entry.pid)
+                } else {
+                    None
+                }
+            })
+        })
+        .collect::<HashSet<_>>();
+
+    let mut relay_details = Vec::new();
+    for entry in netstat_entries {
+        if !relay_listener_pids.contains(&entry.pid) {
+            continue;
+        }
+        let is_listener = matches!(
+            entry.state.to_ascii_uppercase().as_str(),
+            "LISTEN" | "LISTENING"
+        ) && is_loopback_ip(&entry.local_addr)
+            && minecraft_ports.contains(&entry.local_port);
+        let is_loopback_peer = matches!(
+            entry.state.to_ascii_uppercase().as_str(),
+            "ESTABLISHED" | "SYN_SENT" | "SYN_RECEIVED" | "SYN_RECV"
+        ) && is_loopback_ip(&entry.local_addr)
+            && is_loopback_ip(&entry.remote_addr)
+            && minecraft_ports.contains(&entry.local_port);
+        if !(is_listener || is_loopback_peer) {
+            continue;
+        }
+        let process = process_map.get(&entry.pid);
+        let proc_name = process.map(|p| p.name.as_str()).unwrap_or("unknown");
+        relay_details.push(format!(
+            "{}:{} -> {}:{} {} PID {} {}",
+            entry.local_addr,
+            entry.local_port,
+            entry.remote_addr,
+            entry.remote_port,
+            entry.state,
+            entry.pid,
+            proc_name
+        ));
+    }
+
+    let mut shared_remote_details = Vec::new();
+    let mut grouped_flows = HashMap::<(String, u16), HashSet<u32>>::new();
+    for flow in &upstream_flows {
+        grouped_flows
+            .entry((flow.remote_addr.clone(), flow.remote_port))
+            .or_default()
+            .insert(flow.pid);
+    }
+    for ((remote_addr, remote_port), pids) in grouped_flows {
+        if pids.len() < 2 {
+            continue;
+        }
+        let mut pid_list = pids.into_iter().collect::<Vec<_>>();
+        pid_list.sort_unstable();
+        let relay_present = pid_list.iter().any(|pid| relay_listener_pids.contains(pid));
+        if relay_present {
+            shared_remote_details.push(format!(
+                "Multiple Minecraft java processes share the same upstream endpoint {}:{} | pids={:?}",
+                remote_addr, remote_port, pid_list
+            ));
+        }
+    }
+
+    let config_signals = proxy_config_artifacts
+        .iter()
+        .filter_map(parse_proxy_config_signal)
+        .collect::<Vec<_>>();
+    let mut config_details = Vec::new();
+    for signal in &config_signals {
+        let matches_tunnel = signal.tun_interfaces.iter().any(|interface_name| {
+            tunnel_adapters.iter().any(|adapter| {
+                adapter.name.eq_ignore_ascii_case(interface_name)
+                    || adapter
+                        .description
+                        .to_lowercase()
+                        .contains(&interface_name.to_lowercase())
+            })
+        }) || signal.tun_addresses.iter().any(|tun_address| {
+            tunnel_adapters.iter().any(|adapter| {
+                adapter
+                    .ipv4_addresses
+                    .iter()
+                    .any(|ip| tun_address.starts_with(&format!("{ip}/")) || tun_address == ip)
+            })
+        });
+        if !matches_tunnel {
+            continue;
+        }
+        if !signal.final_proxy || signal.loopback_proxy_outbounds.is_empty() {
+            continue;
+        }
+        let matched_listener_ports = signal
+            .loopback_proxy_outbounds
+            .iter()
+            .filter_map(|value| value.rsplit_once(':'))
+            .filter_map(|(_, port)| port.parse::<u16>().ok())
+            .filter(|port| proxy_listener_ports.contains(port))
+            .collect::<Vec<_>>();
+        config_details.push(format!(
+            "{} | tun_if={:?} tun_addr={:?} auto_route={} strict_route={} final=proxy socks={:?} matched_listener_ports={:?} route_processes={:?}",
+            signal.path,
+            signal.tun_interfaces,
+            signal.tun_addresses,
+            signal.auto_route,
+            signal.strict_route,
+            signal.loopback_proxy_outbounds,
+            matched_listener_ports,
+            signal.route_process_names
+        ));
+    }
+
+    let anchor_count =
+        usize::from(!proxy_listener_details.is_empty() || !proxy_udp_details.is_empty())
+            + usize::from(!config_details.is_empty())
+            + usize::from(!relay_details.is_empty() && !shared_remote_details.is_empty());
+
+    let mut details = Vec::new();
+    details.extend(tunnel_flow_details);
+    details.extend(config_details);
+    details.extend(proxy_listener_details);
+    details.extend(proxy_udp_details);
+    details.extend(relay_details);
+    details.extend(shared_remote_details);
+    details.sort();
+    details.dedup();
+
+    if anchor_count >= 2 {
+        findings.push(Finding {
+            confidence: Confidence::High,
+            category: "same_pc_proxy_chain".to_string(),
+            title: "Same-PC tunnel/proxy chain is carrying Minecraft traffic".to_string(),
+            details,
+        });
+    } else if anchor_count == 1 {
+        findings.push(Finding {
+            confidence: Confidence::Medium,
+            category: "same_pc_proxy_chain".to_string(),
+            title: "Same-PC tunnel/proxy chain around Minecraft needs review".to_string(),
+            details,
+        });
+    }
+}
+
+fn detect_minecraft_process_network_context(
+    findings: &mut Vec<Finding>,
+    adapters: &[AdapterBlock],
+    process_map: &HashMap<u32, ProcessMeta>,
+    netstat_entries: &[NetstatTcp],
+    minecraft_ports: &[u16],
+    gateway_ping_ttls: &HashMap<String, u16>,
+) {
+    let upstream_flows =
+        active_minecraft_upstream_connections(netstat_entries, process_map, minecraft_ports);
+    if upstream_flows.is_empty() {
+        return;
+    }
+
+    let primary_physical_ipv4 = adapters
+        .iter()
+        .filter(|adapter| !is_virtualish_adapter(adapter))
+        .flat_map(|adapter| adapter.ipv4_addresses.iter())
+        .find(|ip| is_private_ipv4(ip))
+        .cloned();
+
+    let mut medium = Vec::new();
+    let mut high = Vec::new();
+
+    for flow in upstream_flows {
+        let Some(process) = process_map.get(&flow.pid) else {
+            continue;
+        };
+        let Some(adapter) = adapters.iter().find(|adapter| {
+            adapter
+                .ipv4_addresses
+                .iter()
+                .any(|ip| ip.eq_ignore_ascii_case(&flow.local_addr))
+        }) else {
+            continue;
+        };
+
+        let point_to_point = adapter
+            .subnet_masks
+            .iter()
+            .any(|mask| mask == "255.255.255.252" || mask == "255.255.255.254");
+        let gateway_windowsish = adapter
+            .default_gateways
+            .iter()
+            .find_map(|gateway| gateway_ping_ttls.get(gateway))
+            .is_some_and(|ttl| *ttl >= 120);
+        let path = truncate_text(&process.command_line, 220);
+        let detail = format!(
+            "PID {} {} | {}:{} -> {}:{} via adapter {} ({}) local_ipv4={:?} gw={:?} mask={:?} primary_physical_ipv4={:?} cmd={}",
+            flow.pid,
+            process.name,
+            flow.local_addr,
+            flow.local_port,
+            flow.remote_addr,
+            flow.remote_port,
+            adapter.name,
+            adapter.description,
+            adapter.ipv4_addresses,
+            adapter.default_gateways,
+            adapter.subnet_masks,
+            primary_physical_ipv4,
+            path
+        );
+
+        let fake_loopback = netstat_entries.iter().any(|entry| {
+            entry.pid == flow.pid
+                && matches!(
+                    entry.state.to_ascii_uppercase().as_str(),
+                    "ESTABLISHED" | "SYN_SENT" | "SYN_RECEIVED" | "SYN_RECV"
+                )
+                && (is_loopback_ip(&entry.local_addr) || is_loopback_ip(&entry.remote_addr))
+                && (entry.local_addr.starts_with("127.") || entry.remote_addr.starts_with("127."))
+                && (minecraft_ports.contains(&entry.local_port)
+                    || minecraft_ports.contains(&entry.remote_port))
+        });
+
+        if fake_loopback {
+            high.push(format!(
+                "Minecraft process shows loopback/fake-local peer traffic that matches faker redirect patterns: {detail}"
+            ));
+            continue;
+        }
+
+        if is_virtualish_adapter(adapter)
+            && point_to_point
+            && gateway_windowsish
+            && primary_physical_ipv4
+                .as_ref()
+                .is_some_and(|ip| ip != &flow.local_addr)
+        {
+            medium.push(format!(
+                "Minecraft process is sourced from a point-to-point virtual/tunnel adapter instead of the primary physical interface: {detail}"
+            ));
+        }
+    }
+
+    if !high.is_empty() {
+        findings.push(Finding {
+            confidence: Confidence::High,
+            category: "minecraft_process_network".to_string(),
+            title: "Minecraft process has faker-style loopback redirect traffic".to_string(),
+            details: high,
+        });
+    }
+    if !medium.is_empty() {
+        findings.push(Finding {
+            confidence: Confidence::Medium,
+            category: "minecraft_process_network".to_string(),
+            title: "Minecraft process traffic is bound to a point-to-point virtual adapter"
+                .to_string(),
+            details: medium,
         });
     }
 }
@@ -2419,379 +2466,6 @@ fn summarize_physical_transport(snapshot: &Value) -> String {
     format!("wifi_up={} wired_up={} other_up={}", wifi, wired, other)
 }
 
-fn parse_portproxy_entries(text: &str) -> Vec<PortProxyEntry> {
-    let mut entries = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty()
-            || trimmed.contains("Listen on")
-            || trimmed.contains("Прослушив")
-            || trimmed.chars().all(|ch| ch == '-')
-        {
-            continue;
-        }
-
-        let columns = trimmed.split_whitespace().collect::<Vec<_>>();
-        if columns.len() < 4 {
-            continue;
-        }
-
-        let listen_addr = normalize_ip_literal(columns[0]);
-        let connect_addr = normalize_ip_literal(columns[2]);
-        if !listen_addr.is_empty() && listen_addr != "*" && !is_ip_literal(&listen_addr) {
-            continue;
-        }
-        if !is_ip_literal(&connect_addr) {
-            continue;
-        }
-        let Ok(listen_port) = columns[1].parse::<u16>() else {
-            continue;
-        };
-        let Ok(connect_port) = columns[3].parse::<u16>() else {
-            continue;
-        };
-        entries.push(PortProxyEntry {
-            listen_addr,
-            listen_port,
-            connect_addr,
-            connect_port,
-        });
-    }
-    entries
-}
-
-fn is_vpn_proxy_process_text(text: &str) -> bool {
-    let process_needles = [
-        "adguardvpn",
-        "wireguard",
-        "openvpn",
-        "zerotier",
-        "tailscale",
-        "protonvpn",
-        "nordvpn",
-        "mullvad",
-        "expressvpn",
-        "hamachi",
-        "radmin vpn",
-        "outline",
-        "clash",
-        "v2ray",
-        "nekoray",
-        "sing-box",
-        "singbox",
-        "xray.exe",
-        "happd.exe",
-        "\\happ\\",
-    ];
-    if process_needles.iter().any(|needle| text.contains(needle)) {
-        return true;
-    }
-
-    text.contains("proxy.exe")
-        || text.contains("socks.exe")
-        || text.contains("--proxy")
-        || text.contains("--socks")
-        || text.contains(" -proxy")
-        || text.contains(" -socks")
-}
-
-fn is_virtualish_adapter(adapter: &AdapterBlock) -> bool {
-    let text = format!(
-        "{} {} {}",
-        adapter.name, adapter.description, adapter.physical_address
-    )
-    .to_lowercase();
-    let virtual_needles = [
-        "vpn",
-        "tap",
-        "tun",
-        "wintun",
-        "wireguard",
-        "openvpn",
-        "zerotier",
-        "tailscale",
-        "proton",
-        "nord",
-        "mullvad",
-        "expressvpn",
-        "hamachi",
-        "radmin",
-        "outline",
-        "clash",
-        "v2ray",
-        "nekoray",
-        "sing-box",
-        "vethernet",
-        "hyper-v",
-        "virtualbox",
-        "vmware",
-        "loopback",
-        "tunnel",
-        "docker",
-        "wsl",
-        "bluetooth",
-    ];
-    virtual_needles.iter().any(|needle| text.contains(needle))
-}
-
-fn parse_ipconfig_adapters(text: &str) -> Vec<AdapterBlock> {
-    let mut adapters = Vec::new();
-    let mut current: Option<AdapterBlock> = None;
-    let mut last_multi_key: Option<&'static str> = None;
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            last_multi_key = None;
-            continue;
-        }
-
-        if !line
-            .chars()
-            .next()
-            .map(char::is_whitespace)
-            .unwrap_or(false)
-            && trimmed.ends_with(':')
-        {
-            if let Some(adapter) = current.take() {
-                adapters.push(adapter);
-            }
-            current = Some(AdapterBlock {
-                name: trimmed.trim_end_matches(':').to_string(),
-                ..Default::default()
-            });
-            last_multi_key = None;
-            continue;
-        }
-
-        let Some(adapter) = current.as_mut() else {
-            continue;
-        };
-
-        if let Some(key) = last_multi_key {
-            if !trimmed.contains(" : ") && !trimmed.contains(':') {
-                add_ips_for_key(adapter, key, trimmed);
-                continue;
-            }
-        }
-
-        let Some((label, value)) = line.split_once(':') else {
-            continue;
-        };
-        let label_lower = label.to_lowercase();
-        let value = cleanup_ipconfig_value(value);
-        last_multi_key = None;
-
-        if label_lower.contains("description") || label_lower.contains("опис") {
-            adapter.description = value;
-        } else if label_lower.contains("physical address") || label_lower.contains("физичес")
-        {
-            adapter.physical_address = normalize_mac_display(&value);
-        } else if label_lower.contains("dhcp")
-            && (label_lower.contains("enabled") || label_lower.contains("включ"))
-        {
-            adapter.dhcp_enabled = parse_yes_no(&value);
-        } else if label_lower.contains("ipv4") {
-            adapter.ipv4_addresses.extend(extract_ipv4s(&value));
-        } else if label_lower.contains("subnet") || label_lower.contains("маска") {
-            adapter.subnet_masks.extend(extract_ipv4s(&value));
-        } else if label_lower.contains("default gateway") || label_lower.contains("основ") {
-            adapter.default_gateways.extend(extract_ipv4s(&value));
-            last_multi_key = Some("gateway");
-        } else if label_lower.contains("dhcp")
-            && (label_lower.contains("server") || label_lower.contains("сервер"))
-        {
-            adapter.dhcp_servers.extend(extract_ipv4s(&value));
-            last_multi_key = Some("dhcp");
-        } else if label_lower.contains("dns")
-            && (label_lower.contains("server")
-                || label_lower.contains("сервер")
-                || label_lower.trim().ends_with("dns"))
-        {
-            adapter.dns_servers.extend(extract_ipv4s(&value));
-            last_multi_key = Some("dns");
-        }
-    }
-
-    if let Some(adapter) = current.take() {
-        adapters.push(adapter);
-    }
-
-    adapters
-        .into_iter()
-        .filter(|a| {
-            !a.name.to_lowercase().contains("windows ip configuration")
-                && (!a.ipv4_addresses.is_empty()
-                    || !a.physical_address.is_empty()
-                    || !a.default_gateways.is_empty())
-        })
-        .collect()
-}
-
-fn add_ips_for_key(adapter: &mut AdapterBlock, key: &str, value: &str) {
-    let ips = extract_ipv4s(value);
-    if ips.is_empty() {
-        return;
-    }
-    match key {
-        "gateway" => adapter.default_gateways.extend(ips),
-        "dhcp" => adapter.dhcp_servers.extend(ips),
-        "dns" => adapter.dns_servers.extend(ips),
-        _ => {}
-    }
-}
-
-fn cleanup_ipconfig_value(value: &str) -> String {
-    value
-        .trim()
-        .replace("(Preferred)", "")
-        .replace("(Duplicate)", "")
-        .replace("(Deprecated)", "")
-        .replace("(Основной)", "")
-        .replace("(Повторяющийся)", "")
-        .trim()
-        .to_string()
-}
-
-fn parse_yes_no(value: &str) -> Option<bool> {
-    let lower = value.to_lowercase();
-    if lower.contains("yes") || lower.contains("да") || lower.contains("enabled") {
-        Some(true)
-    } else if lower.contains("no") || lower.contains("нет") || lower.contains("disabled") {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn parse_arp_entries(text: &str) -> Vec<ArpEntry> {
-    let re =
-        Regex::new(r"(?i)^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-f]{2}(?:-[0-9a-f]{2}){5})\s+(\S+)")
-            .unwrap();
-    let mut interface = String::new();
-    let mut entries = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.contains("---")
-            && (trimmed.to_lowercase().contains("interface")
-                || trimmed.to_lowercase().contains("интерф"))
-        {
-            interface = trimmed.to_string();
-            continue;
-        }
-        if let Some(cap) = re.captures(line) {
-            entries.push(ArpEntry {
-                interface: interface.clone(),
-                ip: cap[1].to_string(),
-                mac: normalize_mac_display(&cap[2]),
-                kind: cap[3].to_string(),
-            });
-        }
-    }
-    entries
-}
-
-fn parse_pathping_hops(text: &str) -> Vec<PathHop> {
-    let hop_re =
-        Regex::new(r"^\s*(\d{1,2})\s+(?:<?\d+\s*ms|\*)\s+(?:<?\d+\s*ms|\*)\s+(?:<?\d+\s*ms|\*)\s+(\d{1,3}(?:\.\d{1,3}){3})")
-            .unwrap();
-    let mut hops = Vec::new();
-    for line in text.lines() {
-        let lower = line.to_lowercase();
-        if lower.contains("computing statistics") || lower.contains("подсчет") {
-            break;
-        }
-        if let Some(cap) = hop_re.captures(line) {
-            if let Ok(hop) = cap[1].parse::<u32>() {
-                hops.push(PathHop {
-                    hop,
-                    ip: cap[2].to_string(),
-                });
-            }
-        }
-    }
-    hops
-}
-
-fn parse_gateway_ping_ttls(raw_commands: &[CommandArtifact]) -> HashMap<String, u16> {
-    let ttl_re = Regex::new(r"(?i)\bttl\s*[=< ]\s*(\d+)\b").unwrap();
-    let mut ttls = HashMap::new();
-
-    for artifact in raw_commands
-        .iter()
-        .filter(|artifact| artifact.name.starts_with("ping_gateway_"))
-    {
-        let gateway = artifact
-            .command
-            .split_whitespace()
-            .last()
-            .filter(|value| is_valid_ipv4(value))
-            .map(str::to_string)
-            .or_else(|| {
-                artifact
-                    .name
-                    .strip_prefix("ping_gateway_")
-                    .map(|value| value.replace('_', "."))
-                    .filter(|value| is_valid_ipv4(value))
-            });
-        let Some(gateway) = gateway else {
-            continue;
-        };
-
-        let Some(cap) = ttl_re.captures(&artifact.output) else {
-            continue;
-        };
-        let Ok(ttl) = cap[1].parse::<u16>() else {
-            continue;
-        };
-
-        ttls.insert(gateway, ttl);
-    }
-
-    ttls
-}
-
-fn parse_netstat_tcp(text: &str) -> Vec<NetstatTcp> {
-    let re = Regex::new(r"(?i)^\s*TCP\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)\s*$").unwrap();
-    let mut entries = Vec::new();
-    for line in text.lines() {
-        let Some(cap) = re.captures(line) else {
-            continue;
-        };
-        let Some((local_addr, local_port)) = split_socket(&cap[1]) else {
-            continue;
-        };
-        let Some((remote_addr, remote_port)) = split_socket(&cap[2]) else {
-            continue;
-        };
-        let Ok(pid) = cap[4].parse::<u32>() else {
-            continue;
-        };
-        entries.push(NetstatTcp {
-            local_addr,
-            local_port,
-            remote_addr,
-            remote_port,
-            state: cap[3].to_string(),
-            pid,
-        });
-    }
-    entries
-}
-
-fn split_socket(value: &str) -> Option<(String, u16)> {
-    let value = value.trim();
-    if value.starts_with('[') {
-        let end = value.rfind(']')?;
-        let host = &value[1..end];
-        let port = value[end + 1..].strip_prefix(':')?.parse::<u16>().ok()?;
-        return Some((normalize_ip_literal(host), port));
-    }
-    let (host, port) = value.rsplit_once(':')?;
-    let port = port.parse::<u16>().ok()?;
-    Some((normalize_ip_literal(host), port))
-}
-
 fn discover_minecraft_ports(
     entries: &[NetstatTcp],
     snapshot: &Value,
@@ -3033,17 +2707,51 @@ fn is_wildcard_ip(ip: &str) -> bool {
 
 fn is_minecraft_client_process(name: &str, command_line: &str) -> bool {
     let text = format!("{name} {command_line}").to_lowercase();
-    name.eq_ignore_ascii_case("java.exe")
-        || name.eq_ignore_ascii_case("javaw.exe")
-        || text.contains("minecraft")
-        || text.contains(".minecraft")
-        || text.contains("net.minecraft")
-        || text.contains("lwjgl")
-        || text.contains("fabric")
-        || text.contains("forge")
-        || text.contains("lunarclient")
-        || text.contains("badlion")
-        || text.contains("feather")
+    if text.contains("faker")
+        || text.contains("net.java.faker")
+        || text.contains("-jar")
+            && (text.contains("\\downloads\\") || text.contains("\\desktop\\"))
+            && text.contains(".exe")
+    {
+        return false;
+    }
+
+    [
+        "minecraft",
+        ".minecraft",
+        "net.minecraft",
+        "minecraft.launcher",
+        "--gamedir",
+        "--assetsdir",
+        "java.library.path",
+        "lwjgl",
+        "fabric",
+        "forge",
+        "legacylauncher",
+        "tlauncher",
+        "knotclient",
+        "lunarclient",
+        "badlion",
+        "feather",
+        "mojangtricksinteldriversforperformance_javaw.exe_minecraft.exe.heapdump",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+fn handshake_target_matches_remote(handshake_host: &str, remote_addr: &str) -> bool {
+    let handshake_host = normalize_ip_literal(handshake_host);
+    let remote_addr = normalize_ip_literal(remote_addr);
+    if handshake_host.eq_ignore_ascii_case(&remote_addr) {
+        return true;
+    }
+    if handshake_host.eq_ignore_ascii_case("localhost") && is_loopback_ip(&remote_addr) {
+        return true;
+    }
+    if is_loopback_ip(&handshake_host) && is_loopback_ip(&remote_addr) {
+        return true;
+    }
+    false
 }
 
 fn extract_ipv4s(value: &str) -> Vec<String> {
@@ -3241,312 +2949,6 @@ fn is_self_collection_text(lower: &str) -> bool {
         && lower.contains("convertto-json")
 }
 
-fn detect_process_memory(findings: &mut Vec<Finding>) {
-    let mut system = System::new_all();
-    system.refresh_processes();
-
-    let mut module_hits = Vec::new();
-    let mut memory_hits = Vec::new();
-
-    for process in system.processes().values() {
-        let name = process.name();
-        if !name.eq_ignore_ascii_case("explorer.exe") {
-            continue;
-        }
-        let pid = process.pid().as_u32();
-
-        if let Ok(modules) = list_process_modules(pid) {
-            for module in modules {
-                let lower = module.path.to_string_lossy().to_lowercase();
-                if lower.contains("future_hook_x32.dll") || lower.contains("future_hook_x64.dll") {
-                    module_hits.push(format!(
-                        "PID {} {} loaded module {}",
-                        pid,
-                        name,
-                        module.path.display()
-                    ));
-                }
-            }
-        }
-
-        let patterns: &[(&str, &[u8])] = &[
-            ("future_hook_x64.dll", b"future_hook_x64.dll"),
-            ("future_hook_x32.dll", b"future_hook_x32.dll"),
-            ("xameleon.net", b"xameleon.net"),
-            ("v4apollo.ru", b"v4apollo.ru"),
-            ("PatchThenInject", b"PatchThenInject"),
-            ("GLFW30", b"GLFW30"),
-            ("Shell_TrayWnd", b"Shell_TrayWnd"),
-        ];
-
-        if let Ok(hits) = scan_process_for_strings(pid, patterns, 384 * 1024 * 1024) {
-            let high_hits = hits
-                .iter()
-                .filter(|h| {
-                    h.contains("future_hook") || h.contains("xameleon") || h.contains("v4apollo")
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            if !high_hits.is_empty() {
-                memory_hits.push(format!(
-                    "PID {} {} memory strings: {}",
-                    pid,
-                    name,
-                    high_hits.join(", ")
-                ));
-            }
-        }
-    }
-
-    if !module_hits.is_empty() {
-        findings.push(Finding {
-            confidence: Confidence::High,
-            category: "process_memory".to_string(),
-            title: "explorer.exe has future_hook loaded as a module".to_string(),
-            details: module_hits,
-        });
-    }
-    if !memory_hits.is_empty() {
-        findings.push(Finding {
-            confidence: Confidence::High,
-            category: "process_memory".to_string(),
-            title: "explorer.exe memory contains future_hook/xameleon injection strings"
-                .to_string(),
-            details: memory_hits,
-        });
-    }
-}
-
-#[derive(Clone)]
-struct ModuleInfo {
-    path: PathBuf,
-}
-
-struct HandleGuard(HANDLE);
-
-impl HandleGuard {
-    fn new(handle: HANDLE) -> Result<Self> {
-        if handle.is_invalid() {
-            bail!("invalid handle");
-        }
-        Ok(Self(handle))
-    }
-
-    fn raw(&self) -> HANDLE {
-        self.0
-    }
-}
-
-impl Drop for HandleGuard {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = CloseHandle(self.0);
-        }
-    }
-}
-
-fn open_process_for_query(pid: u32) -> Result<HandleGuard> {
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_FLAGS, false, pid)? };
-    HandleGuard::new(handle).context("OpenProcess failed")
-}
-
-fn list_process_modules(pid: u32) -> Result<Vec<ModuleInfo>> {
-    enum_modules_with_psapi(pid).or_else(|_| enum_modules_with_toolhelp(pid))
-}
-
-fn enum_modules_with_psapi(pid: u32) -> Result<Vec<ModuleInfo>> {
-    let handle = open_process_for_query(pid)?;
-    let mut needed_bytes: u32 = 0;
-    unsafe {
-        EnumProcessModulesEx(
-            handle.raw(),
-            std::ptr::null_mut(),
-            0,
-            &mut needed_bytes,
-            LIST_MODULES_ALL,
-        )?;
-    }
-    if needed_bytes == 0 {
-        bail!("no module data returned");
-    }
-
-    let module_count = (needed_bytes as usize) / std::mem::size_of::<HMODULE>();
-    let mut modules = vec![HMODULE(0); module_count];
-    unsafe {
-        EnumProcessModulesEx(
-            handle.raw(),
-            modules.as_mut_ptr(),
-            needed_bytes,
-            &mut needed_bytes,
-            LIST_MODULES_ALL,
-        )?;
-    }
-
-    let mut results = Vec::new();
-    for module in modules {
-        let mut buffer = vec![0u16; 1024];
-        let len = unsafe { GetModuleFileNameExW(handle.raw(), module, &mut buffer) };
-        if len == 0 {
-            continue;
-        }
-        buffer.truncate(len as usize);
-        results.push(ModuleInfo {
-            path: PathBuf::from(OsString::from_wide(&buffer)),
-        });
-    }
-    if results.is_empty() {
-        bail!("no module paths read via PSAPI");
-    }
-    Ok(results)
-}
-
-fn enum_modules_with_toolhelp(pid: u32) -> Result<Vec<ModuleInfo>> {
-    let snapshot =
-        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)? };
-    if snapshot == INVALID_HANDLE_VALUE {
-        bail!("CreateToolhelp32Snapshot failed");
-    }
-    let snapshot = HandleGuard::new(snapshot)?;
-    let mut entry = MODULEENTRY32W::default();
-    entry.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
-
-    let mut results = Vec::new();
-    let mut has_entry = unsafe { Module32FirstW(snapshot.raw(), &mut entry).is_ok() };
-    while has_entry {
-        if let Some(path) = wide_to_path(&entry.szExePath) {
-            results.push(ModuleInfo { path });
-        }
-        has_entry = unsafe { Module32NextW(snapshot.raw(), &mut entry).is_ok() };
-    }
-    if results.is_empty() {
-        bail!("no module paths read via Toolhelp");
-    }
-    Ok(results)
-}
-
-fn wide_to_path(buffer: &[u16]) -> Option<PathBuf> {
-    let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
-    if len == 0 {
-        return None;
-    }
-    Some(PathBuf::from(OsString::from_wide(&buffer[..len])))
-}
-
-fn scan_process_for_strings(
-    pid: u32,
-    patterns: &[(&str, &[u8])],
-    max_bytes: usize,
-) -> Result<Vec<String>> {
-    let handle = open_process_for_query(pid)?;
-    let mut current = 0usize;
-    let mut scanned = 0usize;
-    let mut hits = Vec::new();
-    let mut seen = HashSet::new();
-    let max_pattern_len = patterns.iter().map(|(_, p)| p.len()).max().unwrap_or(1);
-
-    while scanned < max_bytes {
-        let mut mbi = MEMORY_BASIC_INFORMATION::default();
-        let res = unsafe {
-            VirtualQueryEx(
-                handle.raw(),
-                Some(current as *const c_void),
-                &mut mbi,
-                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-            )
-        };
-        if res == 0 {
-            break;
-        }
-
-        let region_base = mbi.BaseAddress as usize;
-        let region_size = mbi.RegionSize;
-        if region_size == 0 {
-            break;
-        }
-        let region_end = region_base.saturating_add(region_size);
-
-        if mbi.State == MEM_COMMIT && is_readable(mbi.Protect) {
-            let mut offset = region_base;
-            let mut carry = Vec::new();
-            while offset < region_end && scanned < max_bytes {
-                let remaining = region_end - offset;
-                let chunk_size = remaining.min(1024 * 1024).min(max_bytes - scanned);
-                if chunk_size == 0 {
-                    break;
-                }
-                if let Ok(buffer) = read_bytes(handle.raw(), offset, chunk_size) {
-                    let mut haystack = carry.clone();
-                    haystack.extend_from_slice(&buffer);
-                    for (name, pattern) in patterns {
-                        if !seen.contains(*name)
-                            && contains_ascii_case_insensitive(&haystack, pattern)
-                        {
-                            seen.insert((*name).to_string());
-                            hits.push((*name).to_string());
-                        }
-                    }
-                    let keep = max_pattern_len.saturating_sub(1).min(haystack.len());
-                    carry = haystack[haystack.len() - keep..].to_vec();
-                }
-                scanned = scanned.saturating_add(chunk_size);
-                offset = offset.saturating_add(chunk_size.max(1));
-                if hits.len() == patterns.len() {
-                    return Ok(hits);
-                }
-            }
-        }
-
-        if region_end <= current {
-            break;
-        }
-        current = region_end;
-    }
-
-    Ok(hits)
-}
-
-fn read_bytes(handle: HANDLE, address: usize, len: usize) -> Result<Vec<u8>> {
-    let mut buffer = vec![0u8; len];
-    let mut bytes_read: usize = 0;
-    unsafe {
-        ReadProcessMemory(
-            handle,
-            address as *const c_void,
-            buffer.as_mut_ptr() as *mut c_void,
-            len,
-            Some(&mut bytes_read),
-        )?;
-    }
-    buffer.truncate(bytes_read);
-    Ok(buffer)
-}
-
-fn is_readable(protect: PAGE_PROTECTION_FLAGS) -> bool {
-    let value = protect.0;
-    if (value & PAGE_GUARD.0) != 0 || (value & PAGE_NOACCESS.0) != 0 {
-        return false;
-    }
-    let readable_mask = PAGE_READONLY.0
-        | PAGE_READWRITE.0
-        | PAGE_WRITECOPY.0
-        | PAGE_EXECUTE_READ.0
-        | PAGE_EXECUTE_READWRITE.0
-        | PAGE_EXECUTE_WRITECOPY.0;
-    (value & readable_mask) != 0
-}
-
-fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return false;
-    }
-    haystack.windows(needle.len()).any(|window| {
-        window
-            .iter()
-            .zip(needle.iter())
-            .all(|(a, b)| a.eq_ignore_ascii_case(b))
-    })
-}
-
 fn print_console_summary(report: &ScanReport) {
     println!("\nResult: {}", report.overall);
     println!(
@@ -3712,22 +3114,18 @@ fn render_activity_log(report: &ScanReport) -> String {
     out
 }
 
-fn pause_for_enter() {
-    print!("Press Enter to return to menu...");
-    let _ = io::stdout().flush();
-    let mut buf = String::new();
-    let _ = io::stdin().read_line(&mut buf);
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandArtifact, Finding, NetstatTcp, ProcessMeta, bridge_exists,
-        contains_ascii_case_insensitive, detect_pktmon, discover_minecraft_ports,
-        ipv4_in_same_subnet, is_locally_administered_mac, is_vpn_proxy_process_text,
+        AdapterBlock, CommandArtifact, Finding, LocalConfigArtifact, MIN_FAKER_MEMORY_STRING_HITS,
+        NetstatTcp, PacketCaptureAnalysis, PacketTupleStat, ProcessMeta, bridge_exists,
+        contains_ascii_case_insensitive, detect_packet_relay_correlation, detect_pktmon,
+        detect_same_pc_proxy_chain, discover_minecraft_ports, ipv4_in_same_subnet,
+        is_locally_administered_mac, is_vpn_proxy_process_text, normalize_faker_memory_hits,
         parse_arp_entries, parse_gateway_nbtstat, parse_gateway_open_tcp_ports,
         parse_gateway_ping_ttls, parse_ipconfig_adapters, parse_netsh_neighbor_macs,
-        parse_netstat_tcp, parse_pathping_hops, parse_portproxy_entries, sanitize_nbtstat_output,
+        parse_netstat_tcp, parse_pathping_hops, parse_portproxy_entries, parse_proxy_config_signal,
+        sanitize_nbtstat_output,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -3943,13 +3341,35 @@ Address         Port        Address         Port
     }
 
     #[test]
+    fn faker_memory_hits_require_at_least_three_distinct_strings() {
+        let mut hits = normalize_faker_memory_hits(vec![
+            "allowDirectConnection".to_string(),
+            "routerSpoof".to_string(),
+        ]);
+        hits.sort();
+        hits.dedup();
+        assert!(hits.len() < MIN_FAKER_MEMORY_STRING_HITS);
+
+        let mut hits = normalize_faker_memory_hits(vec![
+            "allowDirectConnection".to_string(),
+            "routerSpoof".to_string(),
+            "HttpHostSpoofer".to_string(),
+            "routerSpoof".to_string(),
+        ]);
+        hits.sort();
+        hits.dedup();
+        assert!(hits.len() >= MIN_FAKER_MEMORY_STRING_HITS);
+    }
+
+    #[test]
     fn pktmon_zero_counters_are_not_a_detection() {
         let mut findings: Vec<Finding> = Vec::new();
         detect_pktmon(
             &mut findings,
             "Collected data",
             "JliveF_MC_25565_TCP TCP 25565",
-            "All counters are zero.",
+            "Name Counter Direction Packets Bytes\nAdapter Upper Receive 0 0",
+            r#"[{"Components":[{"Counters":[{"Inbound":{"Packets":0,"Bytes":0},"Outbound":{"Packets":0,"Bytes":0}}]}]}]"#,
             true,
             &[15000, 25565],
         );
@@ -3964,6 +3384,7 @@ Address         Port        Address         Port
             "Collected data",
             "JliveF_MC_25565_TCP TCP 25565",
             "Name Counter Direction Packets Bytes\nAdapter Upper Receive 3 180",
+            r#"{"Groups":[{"Components":[{"Counters":[{"Inbound":{"Packets":3,"Bytes":180},"Outbound":{"Packets":0,"Bytes":0}}]}]}]}"#,
             true,
             &[15000, 25565],
         );
@@ -3978,7 +3399,23 @@ Address         Port        Address         Port
             "Collected data",
             "JliveF_MC_25565_TCP TCP 25565",
             "Name Counter Direction Packets Bytes\nAdapter Upper Receive 2 120",
+            r#"[{"Components":[{"Counters":[{"Inbound":{"Packets":2,"Bytes":120},"Outbound":{"Packets":0,"Bytes":0}}]}]}]"#,
             false,
+            &[15000, 25565],
+        );
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn pktmon_packets_header_without_numeric_hits_is_not_detected() {
+        let mut findings: Vec<Finding> = Vec::new();
+        detect_pktmon(
+            &mut findings,
+            "Collected data",
+            "JliveF_MC_25565_TCP TCP 25565",
+            "Name Counter Direction Packets Bytes\nAdapter Upper Receive Packets Bytes",
+            "",
+            true,
             &[15000, 25565],
         );
         assert!(findings.is_empty());
@@ -4027,5 +3464,316 @@ Address         Port        Address         Port
         assert!(is_vpn_proxy_process_text(
             r#"happ.exe c:\program files\flyfrogllc\happ\happ.exe"#
         ));
+    }
+
+    #[test]
+    fn parses_happ_style_proxy_config_signal() {
+        let artifact = LocalConfigArtifact {
+            path: r#"C:\Users\test\AppData\Local\Happ\config.json"#.to_string(),
+            content: r#"{
+                "inbounds":[{"type":"tun","interface_name":"happ-tun","address":["172.18.0.1/30"],"auto_route":true,"strict_route":true}],
+                "outbounds":[{"type":"socks","server":"127.0.0.1","server_port":10808}],
+                "route":{"final":"proxy","rules":[{"process_name":["xray.exe","sing-box.exe"]}]}
+            }"#
+            .to_string(),
+        };
+        let signal = parse_proxy_config_signal(&artifact).expect("signal");
+        assert!(signal.final_proxy);
+        assert!(signal.auto_route);
+        assert!(signal.strict_route);
+        assert_eq!(signal.tun_interfaces, vec!["happ-tun"]);
+        assert_eq!(signal.loopback_proxy_outbounds, vec!["127.0.0.1:10808"]);
+    }
+
+    #[test]
+    fn parses_happ_style_yaml_proxy_config_signal() {
+        let artifact = LocalConfigArtifact {
+            path: r#"C:\Users\test\AppData\Local\Happ\config.yaml"#.to_string(),
+            content: r#"
+inbounds:
+  - type: tun
+    interface_name: happ-tun
+    address:
+      - 172.18.0.1/30
+    auto_route: true
+    strict_route: true
+outbounds:
+  - type: socks
+    server: 127.0.0.1
+    server_port: 10808
+route:
+  final: proxy
+  rules:
+    - process_name:
+        - xray.exe
+        - sing-box.exe
+"#
+            .to_string(),
+        };
+        let signal = parse_proxy_config_signal(&artifact).expect("yaml signal");
+        assert!(signal.final_proxy);
+        assert!(signal.auto_route);
+        assert!(signal.strict_route);
+        assert_eq!(signal.tun_interfaces, vec!["happ-tun"]);
+        assert_eq!(signal.loopback_proxy_outbounds, vec!["127.0.0.1:10808"]);
+        assert_eq!(
+            signal.route_process_names,
+            vec!["sing-box.exe".to_string(), "xray.exe".to_string()]
+        );
+    }
+
+    #[test]
+    fn detects_same_pc_proxy_chain_for_tunnel_minecraft_flow() {
+        let adapters = vec![AdapterBlock {
+            name: "happ-tun".to_string(),
+            description: "sing-tun Tunnel".to_string(),
+            ipv4_addresses: vec!["172.18.0.1".to_string()],
+            default_gateways: vec!["172.18.0.2".to_string()],
+            ..AdapterBlock::default()
+        }];
+        let entries = vec![
+            NetstatTcp {
+                local_addr: "172.18.0.1".to_string(),
+                local_port: 1146,
+                remote_addr: "5.231.75.25".to_string(),
+                remote_port: 25715,
+                state: "ESTABLISHED".to_string(),
+                pid: 8208,
+            },
+            NetstatTcp {
+                local_addr: "172.18.0.1".to_string(),
+                local_port: 1151,
+                remote_addr: "5.231.75.25".to_string(),
+                remote_port: 25715,
+                state: "ESTABLISHED".to_string(),
+                pid: 5732,
+            },
+            NetstatTcp {
+                local_addr: "127.0.0.1".to_string(),
+                local_port: 10808,
+                remote_addr: "0.0.0.0".to_string(),
+                remote_port: 0,
+                state: "LISTENING".to_string(),
+                pid: 10164,
+            },
+            NetstatTcp {
+                local_addr: "127.0.0.1".to_string(),
+                local_port: 25565,
+                remote_addr: "0.0.0.0".to_string(),
+                remote_port: 0,
+                state: "LISTENING".to_string(),
+                pid: 5732,
+            },
+            NetstatTcp {
+                local_addr: "127.0.0.1".to_string(),
+                local_port: 25565,
+                remote_addr: "127.0.0.2".to_string(),
+                remote_port: 1145,
+                state: "ESTABLISHED".to_string(),
+                pid: 5732,
+            },
+        ];
+        let mut process_map = HashMap::new();
+        process_map.insert(
+            8208,
+            ProcessMeta {
+                name: "javaw.exe".to_string(),
+                pid: 8208,
+                path: r#"C:\Games\Minecraft\javaw.exe"#.to_string(),
+                command_line: "javaw.exe -jar .minecraft".to_string(),
+            },
+        );
+        process_map.insert(
+            5732,
+            ProcessMeta {
+                name: "javaw.exe".to_string(),
+                pid: 5732,
+                path: r#"C:\Games\Minecraft\javaw.exe"#.to_string(),
+                command_line: "javaw.exe -jar .minecraft proxy-relay".to_string(),
+            },
+        );
+        process_map.insert(
+            10164,
+            ProcessMeta {
+                name: "xray.exe".to_string(),
+                pid: 10164,
+                path: r#"C:\Program Files\FlyFrogLLC\Happ\core\xray.exe"#.to_string(),
+                command_line: r#""C:\Program Files\FlyFrogLLC\Happ\core\xray.exe""#.to_string(),
+            },
+        );
+        let snapshot = json!({
+            "Udp": [
+                {
+                    "LocalAddress": "127.0.0.1",
+                    "LocalPort": 10808,
+                    "OwningProcess": 10164
+                }
+            ]
+        });
+        let configs = vec![LocalConfigArtifact {
+            path: r#"C:\Users\test\AppData\Local\Happ\config.json"#.to_string(),
+            content: r#"{
+                "inbounds":[{"type":"tun","interface_name":"happ-tun","address":["172.18.0.1/30"],"auto_route":true,"strict_route":true}],
+                "outbounds":[{"type":"socks","server":"127.0.0.1","server_port":10808}],
+                "route":{"final":"proxy","rules":[{"process_name":["xray.exe","sing-box.exe"]}]}
+            }"#
+            .to_string(),
+        }];
+
+        let mut findings = Vec::new();
+        detect_same_pc_proxy_chain(
+            &mut findings,
+            &adapters,
+            &snapshot,
+            &process_map,
+            &entries,
+            &[25565, 25715],
+            &configs,
+        );
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.category == "same_pc_proxy_chain"
+                    && finding.confidence == super::Confidence::High)
+        );
+    }
+
+    #[test]
+    fn detects_packet_relay_correlation_for_same_upstream_endpoint() {
+        let entries = vec![
+            NetstatTcp {
+                local_addr: "192.168.0.39".to_string(),
+                local_port: 3434,
+                remote_addr: "5.231.75.25".to_string(),
+                remote_port: 25715,
+                state: "ESTABLISHED".to_string(),
+                pid: 8208,
+            },
+            NetstatTcp {
+                local_addr: "192.168.0.39".to_string(),
+                local_port: 3432,
+                remote_addr: "5.231.75.25".to_string(),
+                remote_port: 25715,
+                state: "ESTABLISHED".to_string(),
+                pid: 5732,
+            },
+            NetstatTcp {
+                local_addr: "127.0.0.1".to_string(),
+                local_port: 24431,
+                remote_addr: "0.0.0.0".to_string(),
+                remote_port: 0,
+                state: "LISTENING".to_string(),
+                pid: 5732,
+            },
+            NetstatTcp {
+                local_addr: "127.0.0.1".to_string(),
+                local_port: 24431,
+                remote_addr: "127.0.0.1".to_string(),
+                remote_port: 60000,
+                state: "ESTABLISHED".to_string(),
+                pid: 5732,
+            },
+        ];
+        let mut process_map = HashMap::new();
+        process_map.insert(
+            8208,
+            ProcessMeta {
+                name: "javaw.exe".to_string(),
+                pid: 8208,
+                path: r#"C:\Games\Minecraft\javaw.exe"#.to_string(),
+                command_line: "javaw.exe --gameDir .minecraft".to_string(),
+            },
+        );
+        process_map.insert(
+            5732,
+            ProcessMeta {
+                name: "javaw.exe".to_string(),
+                pid: 5732,
+                path: r#"C:\Users\test\faker-1.7.exe"#.to_string(),
+                command_line: r#""C:\Program Files\Eclipse Adoptium\jdk-21\bin\javaw.exe" -jar "C:\Users\test\faker-1.7.exe""#.to_string(),
+            },
+        );
+
+        let analysis = PacketCaptureAnalysis {
+            total_packets: 40,
+            tuples: vec![
+                PacketTupleStat {
+                    id: "client".to_string(),
+                    pid: 8208,
+                    process_name: "javaw.exe".to_string(),
+                    local_addr: "192.168.0.39".to_string(),
+                    local_port: 3434,
+                    remote_addr: "5.231.75.25".to_string(),
+                    remote_port: 25715,
+                    outbound_packets: 8,
+                    inbound_packets: 9,
+                    outbound_payload_bytes: 240,
+                    inbound_payload_bytes: 280,
+                    syn_out: 1,
+                    syn_in: 0,
+                    fin_out: 0,
+                    fin_in: 0,
+                    rst_out: 0,
+                    rst_in: 0,
+                    ack_out: 7,
+                    ack_in: 9,
+                    ttl_in_values: vec![50],
+                    ttl_out_values: vec![128],
+                    first_time: Some(1.0),
+                    last_time: Some(3.4),
+                    duration: 2.4,
+                    minecraft_handshake_host: Some("funtime.su".to_string()),
+                    minecraft_handshake_port: Some(25715),
+                    minecraft_handshake_protocol: Some(769),
+                    minecraft_handshake_state: Some(2),
+                },
+                PacketTupleStat {
+                    id: "relay".to_string(),
+                    pid: 5732,
+                    process_name: "javaw.exe".to_string(),
+                    local_addr: "192.168.0.39".to_string(),
+                    local_port: 3432,
+                    remote_addr: "5.231.75.25".to_string(),
+                    remote_port: 25715,
+                    outbound_packets: 7,
+                    inbound_packets: 8,
+                    outbound_payload_bytes: 220,
+                    inbound_payload_bytes: 260,
+                    syn_out: 1,
+                    syn_in: 0,
+                    fin_out: 0,
+                    fin_in: 0,
+                    rst_out: 0,
+                    rst_in: 0,
+                    ack_out: 6,
+                    ack_in: 8,
+                    ttl_in_values: vec![50],
+                    ttl_out_values: vec![128],
+                    first_time: Some(1.1),
+                    last_time: Some(3.5),
+                    duration: 2.4,
+                    minecraft_handshake_host: Some("funtime.su".to_string()),
+                    minecraft_handshake_port: Some(25715),
+                    minecraft_handshake_protocol: Some(769),
+                    minecraft_handshake_state: Some(2),
+                },
+            ],
+            endpoints: Vec::new(),
+        };
+
+        let mut findings = Vec::new();
+        detect_packet_relay_correlation(
+            &mut findings,
+            &process_map,
+            &entries,
+            &[25565, 25715],
+            Some(&analysis),
+        );
+
+        assert!(findings.iter().any(|finding| {
+            finding.category == "packet_relay_correlation"
+                && finding.confidence == super::Confidence::High
+        }));
     }
 }
