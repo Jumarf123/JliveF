@@ -1,6 +1,7 @@
 use crate::bypass_scan::utils::run_powershell;
 use crate::dump_report;
 use crate::external_dumper;
+use crate::external_dumper_new;
 use anyhow::{Context, Result, anyhow};
 use chrono::Local;
 use colored::Colorize;
@@ -224,7 +225,23 @@ struct ProcessMetadataJson {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DumperKind {
     Internal,
-    External,
+    ExternalMain,
+    ExternalAlternative,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChoiceTone {
+    Green,
+    Yellow,
+    Red,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DumperChoice {
+    kind: DumperKind,
+    label: &'static str,
+    tone: ChoiceTone,
+    note: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,7 +405,10 @@ pub fn run_dumper() -> Result<()> {
     print_selected_process(&target, &runtime, &metadata);
 
     match prompt_dumper_kind(runtime.java_major)? {
-        DumperKind::External => {
+        DumperKind::ExternalMain => {
+            external_dumper_new::run_for_pid(target.pid)?;
+        }
+        DumperKind::ExternalAlternative => {
             external_dumper::run_for_pid(target.pid)?;
         }
         DumperKind::Internal => match prompt_internal_mode(&metadata)? {
@@ -567,27 +587,86 @@ fn print_selected_process(
 }
 
 fn prompt_dumper_kind(java_major: u32) -> Result<DumperKind> {
-    let external_recommended = java_major >= 9;
+    let choices = dumper_choices(java_major);
     println!();
     println!("Choose dumper for Java {}:", java_major);
-    print_choice_line(1, "internal dumper", !external_recommended);
-    print_choice_line(2, "external dumper", external_recommended);
+    for (index, choice) in choices.iter().enumerate() {
+        print_choice_line(index + 1, choice.label, choice.tone, choice.note);
+    }
     print!("Select dumper: ");
     io::stdout().flush().ok();
 
     match read_menu_choice()?.as_str() {
         "1" => Ok(DumperKind::Internal),
-        "2" => Ok(DumperKind::External),
+        "2" => Ok(DumperKind::ExternalMain),
+        "3" => Ok(DumperKind::ExternalAlternative),
         other => Err(anyhow!("Unknown dumper selection: {other}")),
     }
+}
+
+fn dumper_choices(java_major: u32) -> [DumperChoice; 3] {
+    let internal_tone = if java_major >= 9 {
+        ChoiceTone::Red
+    } else {
+        ChoiceTone::Green
+    };
+    let primary_external_tone = if java_major >= 9 {
+        ChoiceTone::Green
+    } else {
+        ChoiceTone::Red
+    };
+    let alternative_external_tone = if java_major >= 9 {
+        ChoiceTone::Yellow
+    } else {
+        ChoiceTone::Red
+    };
+
+    [
+        DumperChoice {
+            kind: DumperKind::Internal,
+            label: "internal dumper",
+            tone: internal_tone,
+            note: None,
+        },
+        DumperChoice {
+            kind: DumperKind::ExternalMain,
+            label: "external dumper",
+            tone: primary_external_tone,
+            note: Some("main"),
+        },
+        DumperChoice {
+            kind: DumperKind::ExternalAlternative,
+            label: "external dumper alternative",
+            tone: alternative_external_tone,
+            note: Some("alternative"),
+        },
+    ]
 }
 
 fn prompt_internal_mode(metadata: &ProcessMetadata) -> Result<InternalDumperMode> {
     let simple_recommended = process_contains_lunarclient(metadata);
     println!();
     println!("Choose internal dumper mode:");
-    print_choice_line(1, "complex", !simple_recommended);
-    print_choice_line(2, "simple", simple_recommended);
+    print_choice_line(
+        1,
+        "complex",
+        if simple_recommended {
+            ChoiceTone::Red
+        } else {
+            ChoiceTone::Green
+        },
+        None,
+    );
+    print_choice_line(
+        2,
+        "simple",
+        if simple_recommended {
+            ChoiceTone::Green
+        } else {
+            ChoiceTone::Red
+        },
+        None,
+    );
     print!("Select mode: ");
     io::stdout().flush().ok();
 
@@ -598,11 +677,15 @@ fn prompt_internal_mode(metadata: &ProcessMetadata) -> Result<InternalDumperMode
     }
 }
 
-fn print_choice_line(index: usize, label: &str, recommended: bool) {
-    let text = if recommended {
-        format!("{index}) {label} (recommended)").green()
-    } else {
-        format!("{index}) {label}").red()
+fn print_choice_line(index: usize, label: &str, tone: ChoiceTone, note: Option<&str>) {
+    let raw = match note {
+        Some(note) => format!("{index}) {label} ({note})"),
+        None => format!("{index}) {label}"),
+    };
+    let text = match tone {
+        ChoiceTone::Green => raw.green(),
+        ChoiceTone::Yellow => raw.yellow(),
+        ChoiceTone::Red => raw.red(),
     };
     println!("{text}");
 }
@@ -1376,6 +1459,28 @@ mod tests {
         assert_eq!(resolved, generic);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dumper_choices_mark_new_external_as_primary_for_java9_plus() {
+        let choices = dumper_choices(17);
+
+        assert_eq!(choices[0].tone, ChoiceTone::Red);
+        assert_eq!(choices[1].kind, DumperKind::ExternalMain);
+        assert_eq!(choices[1].tone, ChoiceTone::Green);
+        assert_eq!(choices[1].note, Some("main"));
+        assert_eq!(choices[2].kind, DumperKind::ExternalAlternative);
+        assert_eq!(choices[2].tone, ChoiceTone::Yellow);
+        assert_eq!(choices[2].note, Some("alternative"));
+    }
+
+    #[test]
+    fn dumper_choices_mark_all_external_options_red_for_java8() {
+        let choices = dumper_choices(8);
+
+        assert_eq!(choices[0].tone, ChoiceTone::Green);
+        assert_eq!(choices[1].tone, ChoiceTone::Red);
+        assert_eq!(choices[2].tone, ChoiceTone::Red);
     }
 }
 

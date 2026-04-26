@@ -11,6 +11,8 @@ use windows::core::PCWSTR;
 mod bypass_scan;
 mod dump_report;
 mod external_dumper;
+#[path = "external_dumper_New/mod.rs"]
+mod external_dumper_new;
 mod found_faker;
 mod internal_dumper;
 mod jvmti_detector;

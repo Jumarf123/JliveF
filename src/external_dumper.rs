@@ -72,8 +72,9 @@ struct HelperFiles {
 }
 
 pub fn run_for_pid(pid: u32) -> Result<PathBuf> {
-    println!("External dumper: checking Java toolchain and dependencies...");
-    let runtime = detect_runtime(pid).context("detecting target runtime for external dumper")?;
+    println!("External dumper alternative: checking Java toolchain and dependencies...");
+    let runtime =
+        detect_runtime(pid).context("detecting target runtime for external dumper alternative")?;
     let output_path = build_output_path(pid)?;
     let helper_files = stage_helper_source(pid)?;
 
@@ -146,7 +147,7 @@ fn resolve_toolchain(
 
     if target_version.is_some() {
         println!(
-            "External dumper: exact JDK match not found for {}. Trying automatic installation...",
+            "External dumper alternative: exact JDK match not found for {}. Trying automatic installation...",
             display_java_target(target_major, target_version)
         );
         let install_report = attempt_winget_install(target_major, target_version)?;
@@ -160,7 +161,7 @@ fn resolve_toolchain(
                 should_disable_sa_version_check(target_version, toolchain.java_version.as_deref());
             if toolchain.disable_sa_version_check {
                 println!(
-                    "External dumper: exact JDK version {} is unavailable. Falling back to {} from {} with SA version check disabled.",
+                    "External dumper alternative: exact JDK version {} is unavailable. Falling back to {} from {} with SA version check disabled.",
                     display_optional_version(target_version),
                     display_optional_version(toolchain.java_version.as_deref()),
                     toolchain.origin
@@ -191,7 +192,7 @@ or Java 11+ source-file mode.{}",
     }
 
     println!(
-        "External dumper: compatible JDK not found for Java {}. Trying automatic installation...",
+        "External dumper alternative: compatible JDK not found for Java {}. Trying automatic installation...",
         display_java_major(target_major)
     );
     let install_report = attempt_winget_install(target_major, target_version)?;
@@ -349,11 +350,11 @@ fn attempt_winget_install(
 
             exact_version_seen = true;
             println!(
-                "External dumper: installing exact dependency via winget (`{package_id}` {package_version})..."
+                "External dumper alternative: installing exact dependency via winget (`{package_id}` {package_version})..."
             );
             if install_winget_package(&winget, package_id, Some(&package_version))? {
                 println!(
-                    "External dumper: dependency installation finished for `{package_id}` version `{package_version}`."
+                    "External dumper alternative: dependency installation finished for `{package_id}` version `{package_version}`."
                 );
                 return Ok(Some(format!("{package_id} {package_version}")));
             }
@@ -361,7 +362,7 @@ fn attempt_winget_install(
 
         if !exact_version_seen {
             println!(
-                "External dumper: winget does not expose an exact package version for target {}. Falling back to latest Java {} package.",
+                "External dumper alternative: winget does not expose an exact package version for target {}. Falling back to latest Java {} package.",
                 display_optional_version(Some(target_version)),
                 display_java_major(target_major)
             );
@@ -369,9 +370,13 @@ fn attempt_winget_install(
     }
 
     for package_id in packages {
-        println!("External dumper: installing missing dependency via winget (`{package_id}`)...");
+        println!(
+            "External dumper alternative: installing missing dependency via winget (`{package_id}`)..."
+        );
         if install_winget_package(&winget, &package_id, None)? {
-            println!("External dumper: dependency installation finished for `{package_id}`.");
+            println!(
+                "External dumper alternative: dependency installation finished for `{package_id}`."
+            );
             return Ok(Some(package_id));
         }
     }
@@ -908,7 +913,9 @@ fn install_winget_package(winget: &Path, package_id: &str, version: Option<&str>
         return Ok(true);
     }
 
-    println!("External dumper: winget install failed for `{package_id}` with status {status}.");
+    println!(
+        "External dumper alternative: winget install failed for `{package_id}` with status {status}."
+    );
     Ok(false)
 }
 
@@ -967,7 +974,10 @@ fn build_output_path(pid: u32) -> Result<PathBuf> {
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| anyhow!("Could not resolve executable directory"))?;
-    let output_dir = exe_dir.join("results").join("dumper").join("external");
+    let output_dir = exe_dir
+        .join("results")
+        .join("dumper")
+        .join("external_alternative");
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("creating output dir {}", output_dir.display()))?;
     let timestamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
@@ -976,7 +986,7 @@ fn build_output_path(pid: u32) -> Result<PathBuf> {
 
 fn stage_helper_source(pid: u32) -> Result<HelperFiles> {
     let helper_dir = std::env::temp_dir()
-        .join("external_dumper_sa")
+        .join("external_dumper_alternative_sa")
         .join(pid.to_string());
     fs::create_dir_all(&helper_dir)
         .with_context(|| format!("creating helper dir {}", helper_dir.display()))?;
@@ -1055,10 +1065,9 @@ fn run_sa_dump(
 }
 
 fn compile_helper(toolchain: &JavaToolchain, helper_files: &HelperFiles) -> Result<()> {
-    let javac_path = toolchain
-        .javac_path
-        .as_ref()
-        .ok_or_else(|| anyhow!("javac.exe is required to prepare external dumper helper"))?;
+    let javac_path = toolchain.javac_path.as_ref().ok_or_else(|| {
+        anyhow!("javac.exe is required to prepare external dumper alternative helper")
+    })?;
 
     let mut command = Command::new(javac_path);
     configure_javac_command(&mut command, toolchain, helper_files)?;
