@@ -72,11 +72,6 @@
 
 Ищет сигнатуры JVMTI/JNI-инжектов в процессах `javaw.exe`.
 
-**Коды результата:**
-- `code 10` — инжект не обнаружен.
-- `code 50` — возможен инжект.
-- `code 80` — подтверждённый инжект.
-
 #### 5. Found Faker
 
 Запускает анализ Wi‑Fi, ARP и hosted network для обнаружения faker.
@@ -162,11 +157,6 @@ A graphical system information viewer with PowerShell-based log collection.
 #### 4. JVMTI Detector
 
 Searches for JVMTI/JNI injection signatures in `javaw.exe` processes.
-
-**Result codes:**
-- `code 10` — no injection detected.
-- `code 50` — possible injection.
-- `code 80` — confirmed injection.
 
 #### 5. Found Faker
 
