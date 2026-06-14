@@ -1,13 +1,10 @@
 use std::ffi::{OsString, c_void};
-use std::fs;
+use std::io::{self, Write};
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, bail};
-use encoding_rs::{UTF_16LE, WINDOWS_1251};
+use anyhow::{Context, Result, anyhow, bail};
 use sysinfo::System;
-use uuid::Uuid;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, INVALID_HANDLE_VALUE};
 use windows::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64, ReadProcessMemory};
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -32,10 +29,9 @@ const PROCESS_QUERY_FLAGS: PROCESS_ACCESS_RIGHTS =
 
 const PATTERN_A: u32 = 524_294;
 const PATTERN_B: u32 = 4_242_546_329;
-const EMBEDDED_JMD: &[u8] = include_bytes!("../jmd/jmd.exe");
 
 pub fn run_detector_cli() -> Result<()> {
-    let result = scan_all_javaw();
+    let result = scan_targets()?;
     println!(
         "{}",
         if result.found {
@@ -46,10 +42,6 @@ pub fn run_detector_cli() -> Result<()> {
     );
     if !result.message.is_empty() {
         println!("{}", result.message);
-    }
-    if !result.jmd_output.is_empty() {
-        println!("\n[jmd.exe output]");
-        println!("{}", result.jmd_output);
     }
     Ok(())
 }
@@ -67,36 +59,25 @@ struct ModuleInfo {
 struct DetectionResult {
     found: bool,
     message: String,
-    jmd_output: String,
 }
 
-fn scan_all_javaw() -> DetectionResult {
-    let jmd_output = run_embedded_jmd().unwrap_or_else(|err| format!("jmd.exe failed: {err}"));
-    match scan_internal() {
-        Ok((found, message)) => DetectionResult {
-            found,
-            message,
-            jmd_output,
-        },
-        Err(err) => DetectionResult {
-            found: false,
-            message: format!("Ошибка проверки: {}", err),
-            jmd_output,
-        },
-    }
+struct ProcessAnalysis {
+    found: bool,
+    message: String,
 }
 
-fn scan_internal() -> Result<(bool, String)> {
+fn scan_targets() -> Result<DetectionResult> {
     let processes = find_javaw_processes();
     if processes.is_empty() {
-        return Ok((false, "Процессы javaw.exe не найдены".to_string()));
+        let pid = prompt_for_pid("javaw.exe не найден. Введите PID процесса Minecraft: ")?;
+        return scan_single_pid(pid);
     }
 
     let mut found = false;
     let mut messages = Vec::new();
     for process in processes {
         match analyze_process(process.pid) {
-            Ok(result) => {
+            Ok(Some(result)) => {
                 if result.found {
                     found = true;
                 }
@@ -104,6 +85,7 @@ fn scan_internal() -> Result<(bool, String)> {
                     messages.push(result.message);
                 }
             }
+            Ok(None) => {}
             Err(err) => {
                 messages.push(format!("PID {}: ошибка проверки: {}", process.pid, err));
             }
@@ -114,22 +96,36 @@ fn scan_internal() -> Result<(bool, String)> {
         messages.push("Паттерны JVMTI-инъекции не обнаружены".to_string());
     }
 
-    Ok((found, messages.join("\n\n")))
+    Ok(DetectionResult {
+        found,
+        message: messages.join("\n\n"),
+    })
 }
 
-fn analyze_process(pid: u32) -> Result<DetectionResult> {
+fn scan_single_pid(pid: u32) -> Result<DetectionResult> {
+    match analyze_process(pid) {
+        Ok(Some(result)) => Ok(DetectionResult {
+            found: result.found,
+            message: result.message,
+        }),
+        Ok(None) => Ok(DetectionResult {
+            found: false,
+            message: format!("PID {pid}: jvm.dll не найден"),
+        }),
+        Err(err) => Ok(DetectionResult {
+            found: false,
+            message: format!("PID {pid}: ошибка проверки: {err}"),
+        }),
+    }
+}
+
+fn analyze_process(pid: u32) -> Result<Option<ProcessAnalysis>> {
     let modules = list_process_modules(pid)?;
     let handle = open_process_for_query(pid)?;
 
     let (base, size, jvm_path) = match find_jvm_image(&modules, &handle) {
         Some(range) => range,
-        None => {
-            return Ok(DetectionResult {
-                found: false,
-                message: String::new(),
-                jmd_output: String::new(),
-            });
-        }
+        None => return Ok(None),
     };
 
     let hit_a = trace_dword(&handle, base, size, PATTERN_A);
@@ -139,76 +135,34 @@ fn analyze_process(pid: u32) -> Result<DetectionResult> {
     if let (Some(hit_a), Some(hit_b)) = (&hit_a, &hit_b) {
         let desc_a = format_hit("паттерн A", PATTERN_A, hit_a);
         let desc_b = format_hit("паттерн B", PATTERN_B, hit_b);
-        Ok(DetectionResult {
+        Ok(Some(ProcessAnalysis {
             found: true,
             message: format!(
                 "{prefix}: обнаружены сигнатуры JVMTI/JNI-инъекции\n{desc_a}\n{desc_b}"
             ),
-            jmd_output: String::new(),
-        })
+        }))
     } else {
-        Ok(DetectionResult {
+        Ok(Some(ProcessAnalysis {
             found: false,
             message: String::new(),
-            jmd_output: String::new(),
-        })
+        }))
     }
 }
 
-fn run_embedded_jmd() -> Result<String> {
-    let temp_path = write_temp_jmd()?;
-    let output = Command::new(&temp_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("running {}", temp_path.display()))?;
+fn prompt_for_pid(prompt: &str) -> Result<u32> {
+    loop {
+        print!("{prompt}");
+        io::stdout().flush().ok();
 
-    let stdout = decode_bytes(&output.stdout);
-    let stderr = decode_bytes(&output.stderr);
-    let _ = fs::remove_file(&temp_path);
-
-    let mut combined = String::new();
-    if !stdout.trim().is_empty() {
-        combined.push_str(stdout.trim());
-    }
-    if !stderr.trim().is_empty() {
-        if !combined.is_empty() {
-            combined.push_str("\n");
+        let mut input = String::new();
+        let bytes_read = io::stdin().read_line(&mut input).context("reading PID")?;
+        if bytes_read == 0 {
+            return Err(anyhow!("PID input was closed"));
         }
-        combined.push_str(stderr.trim());
-    }
 
-    if combined.is_empty() {
-        combined = if output.status.success() {
-            "jmd.exe completed without output".to_string()
-        } else {
-            format!("jmd.exe exited with status {}", output.status)
-        };
-    }
-
-    Ok(combined)
-}
-
-fn write_temp_jmd() -> Result<PathBuf> {
-    let path = std::env::temp_dir().join(format!("jlivef-jmd-{}.exe", Uuid::new_v4()));
-    fs::write(&path, EMBEDDED_JMD).with_context(|| format!("writing {}", path.display()))?;
-    Ok(path)
-}
-
-fn decode_bytes(bytes: &[u8]) -> String {
-    if bytes.is_empty() {
-        return String::new();
-    }
-    if bytes.len() > 2 && bytes[1] == 0 {
-        let (cow, _, _) = UTF_16LE.decode(bytes);
-        return cow.trim_matches('\u{feff}').to_string();
-    }
-    match String::from_utf8(bytes.to_vec()) {
-        Ok(text) => text,
-        Err(_) => {
-            let (cow, _, _) = WINDOWS_1251.decode(bytes);
-            cow.to_string()
+        match input.trim().parse::<u32>() {
+            Ok(pid) if pid != 0 => return Ok(pid),
+            _ => println!("Введите корректный PID."),
         }
     }
 }

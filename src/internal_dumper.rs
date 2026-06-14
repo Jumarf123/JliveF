@@ -212,12 +212,15 @@ struct JavaProcessEntry {
 
 #[derive(Debug, Clone, Default)]
 struct ProcessMetadata {
+    executable_path: Option<String>,
     command_line: Option<String>,
     main_hint: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ProcessMetadataJson {
+    #[serde(rename = "executablePath")]
+    executable_path: Option<String>,
     #[serde(rename = "commandLine")]
     command_line: Option<String>,
 }
@@ -380,25 +383,27 @@ struct SessionProfileSummary {
 pub fn run_dumper() -> Result<()> {
     colored::control::set_override(true);
     let processes = list_java_processes()?;
-    if processes.is_empty() {
-        return Err(anyhow!("No running javaw.exe processes were found"));
-    }
+    let target = if processes.is_empty() {
+        println!("javaw.exe не найден. Введите PID процесса вручную:");
+        prompt_custom_process_entry()?
+    } else {
+        println!("Available javaw.exe processes:");
+        for process in &processes {
+            println!(
+                "{}) {} {:.1} GB - {}",
+                process.index, process.name, process.working_set_gb, process.pid
+            );
+        }
+        print_choice_line(0, "ввести свой PID", ChoiceTone::Yellow, None);
+        print!("Select process index, PID or 0 for custom PID: ");
+        io::stdout().flush().ok();
 
-    println!("Available javaw.exe processes:");
-    for process in &processes {
-        println!(
-            "{}) {} {:.1} GB - {}",
-            process.index, process.name, process.working_set_gb, process.pid
-        );
-    }
-    print!("Select process index or PID: ");
-    io::stdout().flush().ok();
-
-    let mut selection = String::new();
-    io::stdin()
-        .read_line(&mut selection)
-        .context("reading process selection")?;
-    let target = resolve_process_selection(selection.trim(), &processes)?;
+        let mut selection = String::new();
+        io::stdin()
+            .read_line(&mut selection)
+            .context("reading process selection")?;
+        resolve_process_selection(selection.trim(), &processes)?
+    };
     let runtime = detect_runtime(target.pid).context("detecting target runtime")?;
     let metadata = query_process_metadata(target.pid);
 
@@ -569,10 +574,14 @@ if ($null -ne $proc) {{
         return ProcessMetadata::default();
     };
 
+    let executable_path = parsed
+        .executable_path
+        .filter(|value| !value.trim().is_empty());
     let command_line = parsed.command_line.filter(|value| !value.trim().is_empty());
     let main_hint = command_line.as_deref().and_then(extract_java_main_hint);
 
     ProcessMetadata {
+        executable_path,
         command_line,
         main_hint,
     }
@@ -985,6 +994,9 @@ fn resolve_process_selection(
     raw: &str,
     processes: &[JavaProcessEntry],
 ) -> Result<JavaProcessEntry> {
+    if raw.trim() == "0" {
+        return prompt_custom_process_entry();
+    }
     let parsed = raw
         .trim()
         .parse::<u32>()
@@ -997,7 +1009,50 @@ fn resolve_process_selection(
         .iter()
         .find(|process| process.index == index)
         .cloned()
-        .ok_or_else(|| anyhow!("No javaw.exe matches index or PID {raw}"))
+        .ok_or_else(|| anyhow!("No javaw.exe matches index or PID {raw}. Use 0 for a custom PID"))
+}
+
+fn prompt_custom_process_entry() -> Result<JavaProcessEntry> {
+    let pid = prompt_for_pid("Введите PID процесса: ")?;
+    Ok(build_custom_process_entry(pid))
+}
+
+fn prompt_for_pid(prompt: &str) -> Result<u32> {
+    loop {
+        print!("{prompt}");
+        io::stdout().flush().ok();
+
+        let mut input = String::new();
+        let bytes_read = io::stdin().read_line(&mut input).context("reading PID")?;
+        if bytes_read == 0 {
+            return Err(anyhow!("PID input was closed"));
+        }
+
+        match input.trim().parse::<u32>() {
+            Ok(pid) if pid != 0 => return Ok(pid),
+            _ => println!("Введите корректный PID."),
+        }
+    }
+}
+
+fn build_custom_process_entry(pid: u32) -> JavaProcessEntry {
+    let metadata = query_process_metadata(pid);
+    let name = metadata
+        .executable_path
+        .as_deref()
+        .and_then(|value| Path::new(value).file_name())
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| format!("PID {pid}"));
+    let working_set_bytes = process_working_set(pid).unwrap_or(0);
+
+    JavaProcessEntry {
+        index: 0,
+        name,
+        pid,
+        working_set_bytes,
+        working_set_gb: bytes_to_gb(working_set_bytes),
+    }
 }
 
 fn detect_runtime(pid: u32) -> Result<DetectedRuntime> {
